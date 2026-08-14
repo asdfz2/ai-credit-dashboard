@@ -18,8 +18,6 @@
 
 ![dashboard-preview](docs/images/dashboard-preview.png)
 
-![demo-screenshot](docs/images/demo-screenshot.png)
-
 ## 安装
 
 1. 安装用户脚本管理器：
