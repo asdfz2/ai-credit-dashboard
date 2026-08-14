@@ -1,9 +1,14 @@
 // ==UserScript==
-// @name         Trae 用量仪表盘增强（1.5备份）
-// @namespace    http://tampermonkey.net/
-// @version      1.5.0
-// @description  在 Trae 用量仪表盘页面添加积分消耗总数、各模型积分消耗等增强功能
-// @author       You
+// @name         Trae 用量仪表盘增强
+// @namespace    https://github.com/asdfz2/trae-dashboard-enhancer
+// @version      1.5.1
+// @description  为 Trae 用量仪表盘添加积分消耗统计、模型 breakdown 与近 7 天趋势
+// @author       asdfz2
+// @homepageURL  https://github.com/asdfz2/trae-dashboard-enhancer
+// @supportURL   https://github.com/asdfz2/trae-dashboard-enhancer/issues
+// @downloadURL  https://raw.githubusercontent.com/asdfz2/trae-dashboard-enhancer/main/trae-dashboard-enhancer.user.js
+// @updateURL    https://raw.githubusercontent.com/asdfz2/trae-dashboard-enhancer/main/trae-dashboard-enhancer.user.js
+// @license      MIT
 // @match        https://www.trae.cn/dashboard*
 // @match        https://trae.cn/dashboard*
 // @icon         https://www.trae.cn/favicon.ico
@@ -12,6 +17,7 @@
 // @grant        GM_addStyle
 // @grant        GM_log
 // @run-at       document-end
+// @noframes
 // ==/UserScript==
 
 (function() {
