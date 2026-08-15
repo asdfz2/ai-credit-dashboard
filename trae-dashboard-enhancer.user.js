@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trae 用量仪表盘增强
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
+// @version      1.5.1
 // @description  在 Trae 用量仪表盘页面添加积分消耗总数、各模型积分消耗等增强功能
 // @author       You
 // @match        https://www.trae.cn/dashboard*
@@ -241,7 +241,7 @@
         container.innerHTML = `
             <div class="trae-enhancer-header">
                 <h3>📊 用量增强面板</h3>
-                <span class="trae-enhancer-badge">v1.5</span>
+                <span class="trae-enhancer-badge">v1.5.1</span>
                 <button class="trae-enhancer-btn" onclick="window.location.reload()" style="margin-left: auto;">刷新页面</button>
             </div>
             <div class="trae-enhancer-stats">
@@ -283,19 +283,33 @@
         `;
     }
 
+    function formatLocalDate(date) {
+        return date.getFullYear() + '-' +
+            String(date.getMonth() + 1).padStart(2, '0') + '-' +
+            String(date.getDate()).padStart(2, '0');
+    }
+
+    function parseLocalDateKey(dateStr) {
+        const parts = String(dateStr || '').split('-').map(Number);
+        if (parts.length !== 3 || parts.some(n => !Number.isFinite(n))) return null;
+        const [y, m, d] = parts;
+        const date = new Date(y, m - 1, d);
+        if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+        date.setHours(0, 0, 0, 0);
+        return date;
+    }
+
     function computeStats(sessions, entitlement) {
-        const now = Date.now();
-        const todayStart = new Date();
+        const now = new Date();
+        const todayStart = new Date(now);
         todayStart.setHours(0, 0, 0, 0);
-        const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
-        const monthStart = new Date();
-        monthStart.setDate(1);
+        const todayStr = formatLocalDate(todayStart);
+        const sevenDaysStart = new Date(todayStart);
+        sevenDaysStart.setDate(sevenDaysStart.getDate() - 6);
+        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
         monthStart.setHours(0, 0, 0, 0);
 
         let totalCredits = 0;
-        let todayCredits = 0;
-        let sevenDaysCredits = 0;
-        let monthCredits = 0;
         let totalCalls = 0;
         const modelMap = {};
         const dailyMap = {};
@@ -323,17 +337,6 @@
                 log('usage_time parse failed:', rawDate, typeof rawDate);
             }
 
-            // 按时间范围统计
-            if (ts >= todayStart.getTime()) {
-                todayCredits += credits;
-            }
-            if (ts >= sevenDaysAgo) {
-                sevenDaysCredits += credits;
-            }
-            if (ts >= monthStart.getTime()) {
-                monthCredits += credits;
-            }
-
             // 模型维度
             const model = s.model_name || '未知模型auto';
             if (!modelMap[model]) {
@@ -342,12 +345,9 @@
             modelMap[model].credits += credits;
             modelMap[model].calls += 1;
 
-            // 日期维度（使用本地时间，与 todayCredits 保持一致）
+            // 日期维度：统一本地自然日，后续 today/7天/月均从这里派生
             if (ts > 0) {
-                const d = new Date(ts);
-                const dateStr = d.getFullYear() + '-' +
-                    String(d.getMonth() + 1).padStart(2, '0') + '-' +
-                    String(d.getDate()).padStart(2, '0');
+                const dateStr = formatLocalDate(new Date(ts));
                 if (!dailyMap[dateStr]) {
                     dailyMap[dateStr] = { credits: 0, calls: 0 };
                 }
@@ -361,14 +361,29 @@
             .map(([name, data]) => ({ name, credits: data.credits, calls: data.calls }))
             .sort((a, b) => b.credits - a.credits);
 
-        // 近7天趋势
-        const dailyTrend = Object.entries(dailyMap)
-            .filter(([date]) => {
-                const d = new Date(date);
-                return !isNaN(d.getTime()) && d.getTime() >= sevenDaysAgo;
-            })
-            .map(([date, data]) => ({ date, credits: data.credits, calls: data.calls }))
-            .sort((a, b) => a.date.localeCompare(b.date));
+        // 从同一份本地日汇总派生：今日 / 近7天 / 本月 / 趋势
+        let todayCredits = 0;
+        let sevenDaysCredits = 0;
+        let monthCredits = 0;
+        const dailyTrend = [];
+
+        Object.entries(dailyMap).forEach(([date, data]) => {
+            const day = parseLocalDateKey(date);
+            if (!day) return;
+
+            if (date === todayStr) {
+                todayCredits += data.credits;
+            }
+            if (day.getTime() >= sevenDaysStart.getTime()) {
+                sevenDaysCredits += data.credits;
+                dailyTrend.push({ date, credits: data.credits, calls: data.calls });
+            }
+            if (day.getTime() >= monthStart.getTime()) {
+                monthCredits += data.credits;
+            }
+        });
+
+        dailyTrend.sort((a, b) => a.date.localeCompare(b.date));
 
         // 从权益信息获取总积分/配额
         let totalEntitlementCredits = 0;
@@ -382,15 +397,19 @@
         }
 
         // 问题2：趋势无数据 — 可能是 usage_time 缺失或格式不兼容
-        // 如果 dailyTrend 为空但 sessions 有数据，用当前日期显示
+        // 如果 dailyTrend 为空但 sessions 有数据，用当前本地日期显示
         if (dailyTrend.length === 0 && sessions.length > 0) {
-            const todayStr = new Date().toISOString().substring(0, 10);
             dailyTrend.push({ date: todayStr, credits: totalCredits, calls: totalCalls });
+            todayCredits = totalCredits;
+            sevenDaysCredits = totalCredits;
+            monthCredits = totalCredits;
             log('Trend fallback: assigned all credits to', todayStr);
         }
         log('Stats computed:', {
             sessions: sessions.length,
             totalCredits,
+            todayCredits,
+            sevenDaysCredits,
             dailyTrend: dailyTrend.length + ' entries',
             validTimestamps: Object.keys(dailyMap).length
         });
