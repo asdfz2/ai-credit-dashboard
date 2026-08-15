@@ -20,7 +20,7 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 - `DataStore`：读写 `GM_getValue/GM_setValue`，合并 API 响应，按 `session_id` 去重，触发自动翻页。
 - `setupNetworkInterceptor()`：包装 `window.fetch` 与 `XMLHttpRequest.prototype`，只处理 Trae 相关 URL。
 - `fetchAllPages()`：循环请求后续分页，等待 300ms 后继续，全部完成后重新渲染。
-- `computeStats()`：聚合时间范围、模型维度、日期维度的积分与调用次数。
+- `computeStats()`：模型维度按积分累加；日期维度按「分」（×100 整数）累加进 `dailyMap`，再派生今日 / 近 7 天 / 本月 / 趋势，保证卡片与柱状图整数口径一致。
 - `renderDashboard()` / `renderModelBreakdown()` / `renderTrendChart()`：注入统计卡片、模型条形图和 7 天趋势图。
 - `getOrCreateContainer()`：在 `main`、`.dashboard-content`、`#app > div` 等容器下创建面板根节点。
 - `observePageChanges()`：用 `MutationObserver` 监听 DOM，路由切换导致面板被移除时自动重建。
@@ -54,6 +54,7 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 - **同时包装 fetch 与 XHR**：页面两种请求方式都可能触发，只拦截一种会漏数据。
 - **多级回退**：拦截器可能因页面加载顺序、框架封装方式而漏掉请求，回退策略保证面板不空白。
 - **MutationObserver 重建面板**：Trae 是 SPA，路由切换后注入节点可能被框架清空。
+- **时间范围统一走本地自然日**：今日、近 7 天、本月与趋势图共用 `dailyMap`，避免时间戳阈值与日期字符串过滤混用导致不一致。
 
 ## 已知限制
 

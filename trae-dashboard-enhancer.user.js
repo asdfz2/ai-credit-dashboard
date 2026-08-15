@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trae 用量仪表盘增强
 // @namespace    http://tampermonkey.net/
-// @version      1.5.1
+// @version      1.5.9
 // @description  在 Trae 用量仪表盘页面添加积分消耗总数、各模型积分消耗等增强功能
 // @author       You
 // @match        https://www.trae.cn/dashboard*
@@ -35,6 +35,7 @@
         const CONFIG = {
             storageKey: 'trae_usage_data',
             refreshInterval: 60000, // 60秒检查一次新数据
+            maxAutoPages: 100, // 无分页元数据时自发现翻页的最大页数上限
         };
 
     // ========== 数据管理 ==========
@@ -49,8 +50,8 @@
         set(data) {
             GM_setValue(CONFIG.storageKey, JSON.stringify(data));
         },
-        // 合并API响应数据
-        mergeApiResponse(url, responseData) {
+        // 合并API响应数据；requestInfo 携带该响应对应的请求体/请求头，用于按正确范围翻页
+        mergeApiResponse(url, responseData, requestInfo) {
             const store = this.get();
             if (!store.api_responses) store.api_responses = [];
             if (!store.usage_sessions) store.usage_sessions = [];
@@ -84,18 +85,29 @@
                     });
                 }
 
-                // 自动翻页：检测分页字段
+                // 自动翻页：有分页元数据则按元数据翻页；无元数据但已返回会话则自发现翻页（靠去重守卫截断）
                 const total = responseData.total || responseData.count || 0;
-                const pageSize = responseData.pageSize || responseData.page_size || responseData.limit || 21;
+                const pageSize = responseData.pageSize || responseData.page_size || responseData.limit || sessions.length || 21;
                 const currentPage = responseData.page || 1;
-                const totalPages = responseData.totalPages || responseData.total_pages || Math.ceil(total / pageSize);
+                const hasMetadata = total > 0;
+                const totalPages = hasMetadata
+                    ? (responseData.totalPages || responseData.total_pages || Math.ceil(total / pageSize))
+                    : 0;
+                const needDiscovery = !hasMetadata && sessions.length > 0;
 
-                if (total > 0 && totalPages > currentPage && !store._autoFetching) {
+                // 该响应对应的请求体/请求头（优先用随响应传入的，回退到最近一次请求）
+                const rbody = (requestInfo && requestInfo.body) ? requestInfo.body : (_lastApiRequest.body || {});
+                const rheaders = (requestInfo && requestInfo.headers) ? requestInfo.headers : (_lastApiRequest.headers || {});
+                const rsig = JSON.stringify(rbody);
+
+                // 仅当尚未翻页，或当前翻页的是另一个范围（请求体不同）时才触发，避免切换 7天/30天 时被旧翻页占位漏掉
+                if ((!store._autoFetching || store._pagingKey !== rsig) && (hasMetadata ? totalPages > currentPage : needDiscovery)) {
                     store._autoFetching = true;
+                    store._pagingKey = rsig;
                     this.set(store);
-                    log('Auto-pagination: page ' + currentPage + '/' + totalPages + ', sessions:' + total);
-                    const body = _lastApiRequest.body || {};
-                    fetchAllPages(url, body, totalPages, currentPage);
+                    const targetPages = hasMetadata ? totalPages : currentPage + CONFIG.maxAutoPages;
+                    log('Auto-pagination: page ' + currentPage + '/' + targetPages + ', sessions:' + (total || sessions.length));
+                    fetchAllPages(url, rbody, targetPages, currentPage, rheaders, needDiscovery);
                 }
 
                 sessions.forEach(session => {
@@ -131,28 +143,59 @@
     // ========== 自动翻页获取所有历史数据 ==========
     // 存储上一次请求的 body 和 URL，用于翻页
     let _lastApiRequest = {};
+    // 原始 fetch（未包装），翻页回放用它，避免触发拦截器重复合并导致去重守卫误判中断
+    let _rawFetch = null;
 
-    async function fetchAllPages(baseUrl, requestBody, totalPages, currentPage) {
+    async function fetchAllPages(baseUrl, requestBody, totalPages, currentPage, requestHeaders, isDiscovery) {
         log('Fetching all pages: current=' + currentPage + ', total=' + totalPages);
-        for (let page = currentPage + 1; page <= totalPages; page++) {
-            try {
-                const body = { ...requestBody, page: page };
-                const resp = await fetch(baseUrl, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
-                });
-                if (resp.ok) {
+        // 优先用原始 fetch（绕过拦截器重复合并）；不可用时回退到包装后的 fetch
+        const doFetch = _rawFetch || window.fetch.bind(window);
+        try {
+            for (let page = currentPage + 1; page <= totalPages; page++) {
+                const before = (DataStore.get().usage_sessions || []).length;
+                try {
+                    // 保留原请求体（含 start_time/end_time/usage_type 等），改用它真实的分页字段 page_num
+                    const body = Object.assign({}, requestBody || {});
+                    const pageField = ('page_num' in body) ? 'page_num' : 'page';
+                    body[pageField] = page;
+                    // 回放时转发原请求头（含鉴权头），否则接口返回 401
+                    const headers = Object.assign({}, requestHeaders || {});
+                    headers['Content-Type'] = 'application/json';
+                    delete headers['content-length'];
+                    delete headers['host'];
+                    delete headers['connection'];
+                    delete headers['accept-encoding'];
+                    const resp = await doFetch(baseUrl, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: headers,
+                        body: JSON.stringify(body)
+                    });
+                    if (!resp.ok) {
+                        log('Auto-fetch page ' + page + ' failed with status ' + resp.status);
+                        break;
+                    }
                     const data = await resp.json();
                     DataStore.mergeApiResponse(baseUrl, data);
-                    log('Fetched page ' + page + '/' + totalPages);
+                    const after = (DataStore.get().usage_sessions || []).length;
+                    log('Fetched page ' + page + '/' + totalPages + ', sessions now: ' + after);
+                    // 仅「无元数据自发现」模式用去重守卫截断；有明确 totalPages 时直接拉完所有页
+                    if (isDiscovery && after === before) {
+                        break;
+                    }
+                } catch (e) {
+                    log('Auto-fetch page ' + page + ' failed:', e);
+                    break;
                 }
-            } catch (e) {
-                log('Auto-fetch page ' + page + ' failed:', e);
+                // 稍微延迟，避免请求过快
+                await new Promise(r => setTimeout(r, 300));
             }
-            // 稍微延迟，避免请求过快
-            await new Promise(r => setTimeout(r, 300));
+        } finally {
+            // 复位翻页状态，允许后续响应再次触发翻页
+            const store = DataStore.get();
+            delete store._autoFetching;
+            delete store._pagingKey;
+            DataStore.set(store);
         }
         renderDashboard();
         log('All pages fetched. Total sessions:', (DataStore.get().usage_sessions || []).length);
@@ -164,15 +207,26 @@
 
         // 拦截 fetch
         const originalFetch = window.fetch;
+        _rawFetch = window.fetch.bind(window);
         window.fetch = function(input, init) {
             const url = typeof input === 'string' ? input : (input.url || '');
+            // 记录用量查询请求体，供自动翻页回放（fetch 路径之前漏了这项，导致翻页请求体为空）
+            const reqInfo = {
+                url: url,
+                method: (init && init.method) || 'GET',
+                body: isUsageSessionApi(url) ? parseRequestBody(init && init.body) : {},
+                headers: normalizeHeaders(init && init.headers)
+            };
+            if (isUsageSessionApi(url)) {
+                _lastApiRequest = reqInfo;
+            }
             return originalFetch.apply(this, arguments).then(async response => {
                 // 只拦截 Trae 相关 API
                 if (isTraeApi(url)) {
                     try {
                         const clonedResponse = response.clone();
                         const data = await clonedResponse.json();
-                        DataStore.mergeApiResponse(url, data);
+                        DataStore.mergeApiResponse(url, data, isUsageSessionApi(url) ? reqInfo : null);
                         renderDashboard();
                     } catch (e) {
                         // 忽略解析错误
@@ -185,29 +239,77 @@
         // 拦截 XMLHttpRequest
         const originalOpen = XMLHttpRequest.prototype.open;
         const originalSend = XMLHttpRequest.prototype.send;
+        const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
         XMLHttpRequest.prototype.open = function(method, url) {
             this._traeMethod = method;
             this._traeUrl = typeof url === 'string' ? url : (url || '');
+            this._traeHeaders = {};
             return originalOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.setRequestHeader = function(key, value) {
+            if (this._traeUrl && isUsageSessionApi(this._traeUrl) && typeof this._traeHeaders === 'object') {
+                this._traeHeaders[String(key).toLowerCase()] = value;
+            }
+            return originalSetRequestHeader.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function(body) {
             if (this._traeUrl && isTraeApi(this._traeUrl)) {
-                // 保存请求体，用于自动翻页
-                _lastApiRequest = {
+                const reqInfo = {
                     url: this._traeUrl,
                     method: this._traeMethod,
-                    body: body ? JSON.parse(body) : {}
+                    body: isUsageSessionApi(this._traeUrl) ? parseRequestBody(body) : {},
+                    headers: this._traeHeaders || {}
                 };
+                if (isUsageSessionApi(this._traeUrl)) {
+                    // 保存请求体与请求头，用于自动翻页
+                    _lastApiRequest = reqInfo;
+                }
                 this.addEventListener('load', function() {
                     try {
                         const data = JSON.parse(this.responseText);
-                        DataStore.mergeApiResponse(this._traeUrl, data);
+                        DataStore.mergeApiResponse(reqInfo.url, data, isUsageSessionApi(reqInfo.url) ? reqInfo : null);
                         renderDashboard();
                     } catch (e) {}
                 });
             }
             return originalSend.apply(this, arguments);
         };
+    }
+
+    // 是否为用量会话查询接口（自动翻页只针对该接口回放请求体）
+    function isUsageSessionApi(url) {
+        return !!url && url.includes('query_user_usage_group_by_session');
+    }
+
+    // 解析请求体为对象，兼容 JSON 字符串、URLSearchParams 与普通对象
+    function parseRequestBody(body) {
+        if (!body) return {};
+        if (typeof body === 'string') {
+            try { return JSON.parse(body); } catch (e) { return {}; }
+        }
+        if (body instanceof URLSearchParams) {
+            const obj = {};
+            body.forEach((v, k) => { obj[k] = v; });
+            return obj;
+        }
+        if (typeof body === 'object') {
+            return body;
+        }
+        return {};
+    }
+
+    // 规范化为普通对象，兼容 Headers 实例、键值对数组与普通对象
+    function normalizeHeaders(headers) {
+        const result = {};
+        if (!headers) return result;
+        if (headers instanceof Headers) {
+            headers.forEach((v, k) => { result[k] = v; });
+        } else if (Array.isArray(headers)) {
+            headers.forEach(([k, v]) => { result[k] = v; });
+        } else if (typeof headers === 'object') {
+            Object.keys(headers).forEach(k => { result[k] = headers[k]; });
+        }
+        return result;
     }
 
     function isTraeApi(url) {
@@ -241,7 +343,7 @@
         container.innerHTML = `
             <div class="trae-enhancer-header">
                 <h3>📊 用量增强面板</h3>
-                <span class="trae-enhancer-badge">v1.5.1</span>
+                <span class="trae-enhancer-badge">v1.5.9</span>
                 <button class="trae-enhancer-btn" onclick="window.location.reload()" style="margin-left: auto;">刷新页面</button>
             </div>
             <div class="trae-enhancer-stats">
@@ -345,13 +447,13 @@
             modelMap[model].credits += credits;
             modelMap[model].calls += 1;
 
-            // 日期维度：统一本地自然日，后续 today/7天/月均从这里派生
+            // 日期维度：统一本地自然日，按"分"（×100 整数）累加，后续 today/7天/月均从这里派生
             if (ts > 0) {
                 const dateStr = formatLocalDate(new Date(ts));
                 if (!dailyMap[dateStr]) {
-                    dailyMap[dateStr] = { credits: 0, calls: 0 };
+                    dailyMap[dateStr] = { cents: 0, calls: 0 };
                 }
-                dailyMap[dateStr].credits += credits;
+                dailyMap[dateStr].cents += Math.round(credits * 100);
                 dailyMap[dateStr].calls += 1;
             }
         });
@@ -361,10 +463,10 @@
             .map(([name, data]) => ({ name, credits: data.credits, calls: data.calls }))
             .sort((a, b) => b.credits - a.credits);
 
-        // 从同一份本地日汇总派生：今日 / 近7天 / 本月 / 趋势
-        let todayCredits = 0;
-        let sevenDaysCredits = 0;
-        let monthCredits = 0;
+        // 从同一份"分"整数日汇总派生：今日 / 近7天 / 本月 / 趋势
+        let todayCents = 0;
+        let sevenDaysCents = 0;
+        let monthCents = 0;
         const dailyTrend = [];
 
         Object.entries(dailyMap).forEach(([date, data]) => {
@@ -372,14 +474,14 @@
             if (!day) return;
 
             if (date === todayStr) {
-                todayCredits += data.credits;
+                todayCents += data.cents;
             }
             if (day.getTime() >= sevenDaysStart.getTime()) {
-                sevenDaysCredits += data.credits;
-                dailyTrend.push({ date, credits: data.credits, calls: data.calls });
+                sevenDaysCents += data.cents;
+                dailyTrend.push({ date, cents: data.cents, calls: data.calls });
             }
             if (day.getTime() >= monthStart.getTime()) {
-                monthCredits += data.credits;
+                monthCents += data.cents;
             }
         });
 
@@ -399,17 +501,18 @@
         // 问题2：趋势无数据 — 可能是 usage_time 缺失或格式不兼容
         // 如果 dailyTrend 为空但 sessions 有数据，用当前本地日期显示
         if (dailyTrend.length === 0 && sessions.length > 0) {
-            dailyTrend.push({ date: todayStr, credits: totalCredits, calls: totalCalls });
-            todayCredits = totalCredits;
-            sevenDaysCredits = totalCredits;
-            monthCredits = totalCredits;
+            const allCents = Math.round(totalCredits * 100);
+            dailyTrend.push({ date: todayStr, cents: allCents, calls: totalCalls });
+            todayCents = allCents;
+            sevenDaysCents = allCents;
+            monthCents = allCents;
             log('Trend fallback: assigned all credits to', todayStr);
         }
         log('Stats computed:', {
             sessions: sessions.length,
             totalCredits,
-            todayCredits,
-            sevenDaysCredits,
+            todayCredits: todayCents / 100,
+            sevenDaysCredits: sevenDaysCents / 100,
             dailyTrend: dailyTrend.length + ' entries',
             validTimestamps: Object.keys(dailyMap).length
         });
@@ -422,9 +525,9 @@
             totalCredits: Math.round(totalCredits * 100) / 100,
             totalSessions: sessions.length,
             totalCalls: totalCalls,
-            todayCredits: Math.round(todayCredits * 100) / 100,
-            sevenDaysCredits: Math.round(sevenDaysCredits * 100) / 100,
-            monthCredits: Math.round(monthCredits * 100) / 100,
+            todayCredits: todayCents / 100,
+            sevenDaysCredits: sevenDaysCents / 100,
+            monthCredits: monthCents / 100,
             modelBreakdown: modelBreakdown,
             dailyTrend: dailyTrend,
             lastUpdate: lastUpdate
@@ -461,16 +564,16 @@
             return '<div class="trae-enhancer-empty">暂无趋势数据</div>';
         }
 
-        const maxCredits = Math.max(...trend.map(d => d.credits), 1);
+        const maxCents = Math.max(...trend.map(d => d.cents), 1);
 
         let html = '<div class="trend-chart">';
         trend.forEach(d => {
-            const pct = (d.credits / maxCredits * 100).toFixed(1);
+            const pct = (d.cents / maxCents * 100).toFixed(1);
             const dateLabel = d.date.substring(5); // MM-DD
             html += `
                 <div class="trend-bar-wrapper">
                     <div class="trend-bar" style="height: ${pct}%">
-                        <span class="trend-value">${formatNumber(d.credits)}</span>
+                        <span class="trend-value">${formatNumber(d.cents / 100)}</span>
                     </div>
                     <div class="trend-label">${dateLabel}</div>
                 </div>
