@@ -1,11 +1,12 @@
-# Trae 用量仪表盘增强
+# Trae / QwenWork 用量仪表盘增强
 
-为 [Trae](https://www.trae.cn) 个人版用量页面添加增强统计功能的油猴脚本。脚本通过拦截页面 API 请求自动拉取全量分页历史数据，在页面内输出总积分消耗、模型 breakdown 和近 7 天消耗趋势。
+为 [Trae](https://www.trae.cn) 个人版和 [QwenWork](https://qwenwork.cn) 用量页面添加增强统计功能的油猴脚本。脚本通过拦截页面 API 请求或从 DOM 提取数据，在页面内输出总积分消耗、模型 breakdown 和近 7 天消耗趋势。
 
-仅做浏览器端数据展示增强，不修改 Trae 任何服务器数据。
+仅做浏览器端数据展示增强，不修改任何服务器数据。
 
 ## 功能特性
 
+- **多平台支持**：同时支持 Trae（深色主题）和 QwenWork（浅色主题），自动检测域名并适配。
 - **多维度统计**：总积分消耗、今日消耗、近 7 天消耗、本月消耗、会话总数。
 - **模型 breakdown**：展示每个模型消耗的积分与调用次数，并用条形图对比。
 - **趋势可视化**：近 7 天每日积分消耗柱状图。
@@ -16,7 +17,13 @@
 
 ## 效果预览
 
+### Trae（深色主题）
+
 ![dashboard-preview](docs/images/dashboard-preview.png)
+
+### QwenWork（浅色主题）
+
+![QwenWork](docs/images/QwenWork.png)
 
 ## 安装
 
@@ -32,17 +39,20 @@
 
 ## 使用
 
-1. 打开 [Trae 用量页面](https://www.trae.cn/dashboard#usage)。
-2. 增强面板会自动出现在页面内容上方。
+1. 打开用量页面：
+   - Trae：[用量页面](https://www.trae.cn/dashboard#usage)
+   - QwenWork：[用量页面](https://qwenwork.cn/app/settings/usage)
+2. 增强面板会自动出现在页面内容区域。
 3. 如果没有数据，点击面板中的「刷新页面」按钮重试。
 
 ## 工作原理
 
-- 脚本先包装 `fetch` 与 `XMLHttpRequest`，只处理 Trae 相关 API。
+- 脚本先包装 `fetch` 与 `XMLHttpRequest`，只处理 Trae / QwenWork 相关 API。
 - 从用量查询接口的响应中读取分页字段，自动请求剩余分页，每页间隔 300ms。
 - 会话数据按 `session_id` 合并去重后写入 GM 本地存储。
 - 统计与图表由原生 JavaScript 在页面中渲染。
 - 拦截器未命中时，依次回退：点击页面按钮触发请求 → 主动调用用量 API → 从 DOM 文本兜底提取。
+- QwenWork 的 API 全部返回 404，脚本自动切换到 DOM 提取模式，从页面已渲染的文本中解析积分消耗记录。
 
 详细设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -56,6 +66,7 @@
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   └── images/
+│       ├── QwenWork.png
 │       ├── dashboard-preview.png
 │       └── demo-screenshot.png
 └── trae-dashboard-enhancer.user.js
@@ -65,12 +76,13 @@
 
 - 数据只存储在浏览器本地（`GM_setValue`），不会上传到任何服务器。
 - 自动翻页请求间隔 300ms，避免给服务端造成压力。
-- 脚本只做数据展示增强，不修改 Trae 任何服务器数据。
+- 脚本只做数据展示增强，不修改任何服务器数据。
 
 ## 兼容性与限制
 
-- 目标页面：Trae 官网用量 Dashboard。
+- 目标页面：Trae 用量 Dashboard、QwenWork 用量页面。
 - 脚本依赖 Trae 内部 API 路径，官方调整接口后可能需要更新。
+- QwenWork 的 `/api/v1/usage_records` 接口返回 404，数据通过 DOM 提取获取，仅展示当前页面已加载的记录。
 - 本地只保留最近 100 条原始 API 响应，避免存储无限膨胀。
 
 ## FAQ

@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.6.2] - 2026-08-16
+
+### Added
+
+- QwenWork 面板浅色主题适配：白色背景、蓝色数值、灰色标签，与 qwenwork.cn 白色页面融为一体。
+
+### Fixed
+
+- QwenWork 面板改为全宽显示（max-width 1400px），放在页面最下方，与 Trae 面板布局一致。
+
+## [1.6.1] - 2026-08-16
+
+### Added
+
+- QwenWork 用量数据 DOM 提取：从"已使用"按钮的祖先容器中解析积分消耗记录（时间、来源、详情、积分变更）。
+
+### Fixed
+
+- 只提取"已使用"区域的消耗记录，排除"已获得"数据。
+- 修复 `innerText` 在 SVG 元素上为 `undefined` 导致 `trim()` 报错的问题。
+
+### Changed
+
+- 面板容器统一逻辑：qwenwork.cn 直接插入 body 全宽显示，Trae 保持原有容器查找逻辑。
+
+## [1.6.0] - 2026-08-16
+
+### Added
+
+- QwenWork（qwenwork.cn）用量页面支持，自动检测域名并适配。
+- QwenWork API 响应适配：`success: true` + `data.usage_records` 字段解析。
+- `@match` 规则新增 `https://qwenwork.cn/app/settings/usage*` 和 `https://www.qwenwork.cn/app/settings/usage*`。
+
+### Changed
+
+- `@run-at` 改为 `document-start`，更早安装拦截器。
+- 脚本名称改为 "Trae/QwenWork 用量仪表盘增强"。
+
 ## [1.5.9] - 2026-08-15
 
 ### Fixed

@@ -1,17 +1,23 @@
 // ==UserScript==
-// @name         Trae 用量仪表盘增强
-// @namespace    http://tampermonkey.net/
-// @version      1.5.9
-// @description  在 Trae 用量仪表盘页面添加积分消耗总数、各模型积分消耗等增强功能
-// @author       You
+// @name         Trae/QwenWork 用量仪表盘增强
+// @namespace    https://github.com/asdfz2/trae-dashboard-enhancer
+// @version      1.6.2
+// @description  在 Trae/QwenWork 用量仪表盘页面添加积分消耗总数、各模型积分消耗等增强功能
+// @author       asdfz2
+// @license      MIT
+// @homepage     https://github.com/asdfz2/trae-dashboard-enhancer
+// @supportURL   https://github.com/asdfz2/trae-dashboard-enhancer/issues
+// @downloadURL  https://raw.githubusercontent.com/asdfz2/trae-dashboard-enhancer/main/trae-dashboard-enhancer.user.js
 // @match        https://www.trae.cn/dashboard*
 // @match        https://trae.cn/dashboard*
+// @match        https://qwenwork.cn/app/settings/usage*
+// @match        https://www.qwenwork.cn/app/settings/usage*
 // @icon         https://www.trae.cn/favicon.ico
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
 // @grant        GM_log
-// @run-at       document-end
+// @run-at       document-start
 // ==/UserScript==
 
 (function() {
@@ -31,15 +37,51 @@
         document.documentElement.appendChild(debugMarker);
         log('Script started, debug marker injected');
 
+        // ========== 域名检测 ==========
+        const isQwenWork = window.location.hostname.includes('qwenwork.cn');
+        const isTrae = window.location.hostname.includes('trae.cn');
+        log('Running on:', isQwenWork ? 'qwenwork.cn' : isTrae ? 'trae.cn' : 'unknown');
+
         // ========== 配置 ==========
         const CONFIG = {
-            storageKey: 'trae_usage_data',
+            storageKey: isQwenWork ? 'qwenwork_usage_data' : 'trae_usage_data',
             refreshInterval: 60000, // 60秒检查一次新数据
             maxAutoPages: 100, // 无分页元数据时自发现翻页的最大页数上限
         };
 
+        // ========== API 配置（按域名区分）==========
+        const API_CONFIG = {
+            trae: {
+                sessionApi: 'query_user_usage_group_by_session',
+                sessionField: 'user_usage_group_by_sessions',
+                creditField: 'credits_float',
+                altCreditField: 'amount_float',
+                modelField: 'model_name',
+                timeField: 'usage_time',
+                altTimeField: 'created_at',
+                sessionIdField: 'session_id'
+            },
+            qwenwork: {
+                sessionApi: 'usage_records',
+                sessionField: 'usage_records',
+                creditField: 'credits',
+                altCreditField: 'total_tokens',
+                modelField: 'model_name',
+                timeField: 'created_at',
+                altTimeField: 'usage_time',
+                sessionIdField: 'record_id',
+                // qwenwork 特有字段
+                inputTokensField: 'input_tokens',
+                outputTokensField: 'output_tokens',
+                totalTokensField: 'total_tokens'
+            }
+        };
+
+        const currentConfig = isQwenWork ? API_CONFIG.qwenwork : API_CONFIG.trae;
+
     // ========== 数据管理 ==========
     const DataStore = {
+        sessions: null, // 内存缓存（qwenwork.cn DOM 提取用）
         get() {
             try {
                 return JSON.parse(GM_getValue(CONFIG.storageKey, '{}'));
@@ -56,9 +98,13 @@
             if (!store.api_responses) store.api_responses = [];
             if (!store.usage_sessions) store.usage_sessions = [];
 
-            // 只处理成功响应（code=0 或没有 code 字段）
-            const code = responseData && responseData.code;
-            if (code !== undefined && code !== 0 && code !== 200) {
+            // 检查响应是否成功（兼容两种格式）
+            // Trae: code === 0 或 code === 200 或没有 code 字段
+            // QwenWork: success === true
+            const isSuccess = (responseData && responseData.success === true) ||
+                              (responseData && (responseData.code === undefined || responseData.code === 0 || responseData.code === 200));
+            
+            if (!isSuccess) {
                 return store; // 跳过非成功响应
             }
 
@@ -69,29 +115,48 @@
                 data: responseData
             });
 
-            // 解析会话级用量数据
+            // 解析用量数据（兼容两种数据结构）
+            let sessions = null;
+            let pagination = null;
+            
+            // Trae 格式: responseData.user_usage_group_by_sessions
             if (responseData && responseData.user_usage_group_by_sessions) {
-                const sessions = responseData.user_usage_group_by_sessions;
+                sessions = responseData.user_usage_group_by_sessions;
+                pagination = responseData; // Trae 的分页信息在顶层
+            }
+            // QwenWork 格式: responseData.data.usage_records
+            else if (responseData && responseData.data && responseData.data.usage_records) {
+                sessions = responseData.data.usage_records;
+                pagination = responseData.data.pagination || {};
+            }
 
+            if (sessions && Array.isArray(sessions)) {
                 // 日志输出分页信息（仅首次）
                 if (!store._paginationLogged) {
                     store._paginationLogged = true;
                     log('API response top-level keys:', Object.keys(responseData).join(', '));
+                    if (responseData.data) {
+                        log('Response data keys:', Object.keys(responseData.data).join(', '));
+                    }
                     log('Sessions count:', sessions.length);
-                    ['total', 'page', 'pageSize', 'page_size', 'totalPages', 'total_pages', 'hasMore', 'has_more', 'offset', 'limit', 'count'].forEach(key => {
-                        if (responseData[key] !== undefined) {
-                            log('Pagination field -', key + ':', responseData[key]);
-                        }
-                    });
+                    
+                    // 输出分页字段
+                    if (pagination) {
+                        ['total', 'page', 'pageSize', 'page_size', 'totalPages', 'total_pages', 'hasMore', 'has_more', 'offset', 'limit', 'count'].forEach(key => {
+                            if (pagination[key] !== undefined) {
+                                log('Pagination field -', key + ':', pagination[key]);
+                            }
+                        });
+                    }
                 }
 
                 // 自动翻页：有分页元数据则按元数据翻页；无元数据但已返回会话则自发现翻页（靠去重守卫截断）
-                const total = responseData.total || responseData.count || 0;
-                const pageSize = responseData.pageSize || responseData.page_size || responseData.limit || sessions.length || 21;
-                const currentPage = responseData.page || 1;
+                const total = pagination.total || pagination.count || 0;
+                const pageSize = pagination.pageSize || pagination.page_size || pagination.limit || sessions.length || 21;
+                const currentPage = pagination.page || 1;
                 const hasMetadata = total > 0;
                 const totalPages = hasMetadata
-                    ? (responseData.totalPages || responseData.total_pages || Math.ceil(total / pageSize))
+                    ? (pagination.totalPages || pagination.total_pages || Math.ceil(total / pageSize))
                     : 0;
                 const needDiscovery = !hasMetadata && sessions.length > 0;
 
@@ -110,8 +175,15 @@
                     fetchAllPages(url, rbody, targetPages, currentPage, rheaders, needDiscovery);
                 }
 
+                // 合并会话数据（使用对应的去重字段）
+                const idField = currentConfig.sessionIdField;
                 sessions.forEach(session => {
-                    const existing = store.usage_sessions.findIndex(s => s.session_id === session.session_id);
+                    const sessionId = session[idField] || session.session_id;
+                    if (!sessionId) return;
+                    
+                    const existing = store.usage_sessions.findIndex(s => 
+                        (s[idField] || s.session_id) === sessionId
+                    );
                     if (existing >= 0) {
                         store.usage_sessions[existing] = session;
                     } else {
@@ -278,7 +350,11 @@
 
     // 是否为用量会话查询接口（自动翻页只针对该接口回放请求体）
     function isUsageSessionApi(url) {
-        return !!url && url.includes('query_user_usage_group_by_session');
+        if (!url) return false;
+        // Trae: query_user_usage_group_by_session
+        // QwenWork: usage_records (在 /api/v1/ 路径下)
+        return url.includes('query_user_usage_group_by_session') ||
+               (isQwenWork && url.includes('usage_records'));
     }
 
     // 解析请求体为对象，兼容 JSON 字符串、URLSearchParams 与普通对象
@@ -314,14 +390,22 @@
 
     function isTraeApi(url) {
         if (!url) return false;
-        return url.includes('/trae/api/v1/pay/') ||
-               url.includes('/trae/api/v2/pay/') ||
-               url.includes('/cloudide/api/v3/common/GetUserToken') ||
-               url.includes('query_user_usage_group_by_session') ||
-               url.includes('user_current_entitlement_list') ||
-               url.includes('cn_credits_billing_status') ||
-               url.includes('web_user_pay_status') ||
-               url.includes('expired_ents');
+        // Trae API 路径
+        if (url.includes('/trae/api/v1/pay/') ||
+            url.includes('/trae/api/v2/pay/') ||
+            url.includes('/cloudide/api/v3/common/GetUserToken') ||
+            url.includes('query_user_usage_group_by_session') ||
+            url.includes('user_current_entitlement_list') ||
+            url.includes('cn_credits_billing_status') ||
+            url.includes('web_user_pay_status') ||
+            url.includes('expired_ents')) {
+            return true;
+        }
+        // QwenWork API 路径
+        if (isQwenWork && url.includes('/api/v1/usage_records')) {
+            return true;
+        }
+        return false;
     }
 
     // ========== UI 渲染 ==========
@@ -334,7 +418,13 @@
             return;
         }
 
-        const sessions = data.usage_sessions || [];
+        // qwenwork.cn: 应用浅色主题
+        if (isQwenWork) {
+            container.classList.add('qwenwork-theme');
+        }
+
+        // qwenwork.cn: DOM 提取的数据存在 DataStore.sessions（内存）中
+        const sessions = DataStore.sessions || data.usage_sessions || [];
         const entitlement = data.entitlement;
 
         // 计算统计数据
@@ -342,8 +432,8 @@
 
         container.innerHTML = `
             <div class="trae-enhancer-header">
-                <h3>📊 用量增强面板</h3>
-                <span class="trae-enhancer-badge">v1.5.9</span>
+                <h3> 用量增强面板</h3>
+                <span class="trae-enhancer-badge">v1.6.2</span>
                 <button class="trae-enhancer-btn" onclick="window.location.reload()" style="margin-left: auto;">刷新页面</button>
             </div>
             <div class="trae-enhancer-stats">
@@ -417,13 +507,13 @@
         const dailyMap = {};
 
         sessions.forEach(s => {
-            const credits = s.credits_float || s.amount_float || 0;
+            const credits = s[currentConfig.creditField] || s[currentConfig.altCreditField] || 0;
             totalCredits += credits;
             totalCalls += 1;
 
             // 解析时间（兼容多种格式）
             let ts = 0;
-            const rawDate = s.usage_time;
+            const rawDate = s[currentConfig.timeField] || s[currentConfig.altTimeField];
             if (typeof rawDate === 'number' && rawDate > 946684800000) {
                 ts = rawDate; // 毫秒时间戳
             } else if (typeof rawDate === 'number' && rawDate > 946684800) {
@@ -519,7 +609,7 @@
 
         const lastUpdate = sessions.length > 0
             ? new Date().toLocaleString('zh-CN')
-            : '暂无数据，请先使用 Trae';
+            : '暂无数据，请先使用 ' + (isQwenWork ? 'QwenWork' : 'Trae');
 
         return {
             totalCredits: Math.round(totalCredits * 100) / 100,
@@ -536,7 +626,7 @@
 
     function renderModelBreakdown(breakdown) {
         if (breakdown.length === 0) {
-            return '<div class="trae-enhancer-empty">暂无数据，请先使用 Trae 进行对话</div>';
+            return '<div class="trae-enhancer-empty">暂无数据，请先使用 ' + (isQwenWork ? 'QwenWork' : 'Trae') + ' 进行对话</div>';
         }
 
         const maxCredits = Math.max(...breakdown.map(m => m.credits), 1);
@@ -588,7 +678,18 @@
         let container = document.getElementById('trae-enhancer-root');
         if (container) return container;
 
-        // 查找页面主体区域
+        if (isQwenWork) {
+            // qwenwork.cn: 直接放到 body 下，全宽显示，突破 main 的窄布局限制
+            container = document.createElement('div');
+            container.id = 'trae-enhancer-root';
+            container.style.cssText = 'width:100%;max-width:1400px;margin:0 auto;padding:0 20px;box-sizing:border-box;';
+            // 插入到 body 最后（页面最下方）
+            document.body.appendChild(container);
+            log('Creating full-width container on body (qwenwork.cn)');
+            return container;
+        }
+
+        // Trae: 查找页面主体区域
         const main = document.querySelector('main') ||
                      document.querySelector('.dashboard-content') ||
                      document.querySelector('#app > div') ||
@@ -838,48 +939,206 @@
             font-size: 11px;
             color: #555;
         }
+
+        /* ===== qwenwork.cn 浅色主题 ===== */
+        #trae-enhancer-root.qwenwork-theme {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        }
+        #trae-enhancer-root.qwenwork-theme .trae-enhancer-header {
+            border-bottom-color: #e5e7eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .trae-enhancer-header h3 {
+            color: #1f2937;
+        }
+        #trae-enhancer-root.qwenwork-theme .stat-card {
+            background: #f9fafb;
+            border-color: #e5e7eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .stat-label {
+            color: #6b7280;
+        }
+        #trae-enhancer-root.qwenwork-theme .stat-value {
+            color: #2563eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .stat-time {
+            color: #9ca3af;
+        }
+        #trae-enhancer-root.qwenwork-theme .trae-enhancer-section h4 {
+            color: #374151;
+        }
+        #trae-enhancer-root.qwenwork-theme .trae-enhancer-empty {
+            background: #f9fafb;
+            color: #9ca3af;
+        }
+        #trae-enhancer-root.qwenwork-theme .model-bar-wrapper {
+            background: #e5e7eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .model-name {
+            color: #4b5563;
+        }
+        #trae-enhancer-root.qwenwork-theme .model-value {
+            color: #2563eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .model-calls {
+            color: #6b7280;
+        }
+        #trae-enhancer-root.qwenwork-theme .model-tokens {
+            color: #9ca3af;
+        }
+        #trae-enhancer-root.qwenwork-theme .trend-value {
+            color: #2563eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .trend-label {
+            color: #6b7280;
+        }
+        #trae-enhancer-root.qwenwork-theme .session-table th {
+            border-bottom-color: #e5e7eb;
+            color: #6b7280;
+        }
+        #trae-enhancer-root.qwenwork-theme .session-table td {
+            border-bottom-color: #f3f4f6;
+            color: #374151;
+        }
+        #trae-enhancer-root.qwenwork-theme .session-table tr:hover td {
+            background: #f9fafb;
+        }
+        #trae-enhancer-root.qwenwork-theme .trae-enhancer-footer {
+            border-top-color: #e5e7eb;
+        }
+        #trae-enhancer-root.qwenwork-theme .trae-enhancer-hint {
+            color: #9ca3af;
+        }
     `);
 
     // ========== 主动获取 API 数据（拦截器没抓到时的后备方案） ==========
     async function fetchUsageData() {
-        const usageUrl = 'https://api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session';
-        const tokenUrl = 'https://api.trae.cn/cloudide/api/v3/common/GetUserToken';
-
-        // 先尝试获取用户 token
-        let token = null;
-        try {
-            const tokenResp = await fetch(tokenUrl, {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' }
-            });
-            if (tokenResp.ok) {
-                const tokenData = await tokenResp.json();
-                token = tokenData;
-                log('Got token:', tokenData);
+        if (isQwenWork) {
+            // QwenWork 诊断：检查页面是否有内嵌数据
+            log('QwenWork: Checking for embedded data...');
+            
+            // 找到"已使用" BUTTON 的祖先容器，从中提取数据
+            const usedTab = Array.from(document.querySelectorAll('*')).find(el => 
+                el.innerText && el.innerText.trim() === '已使用' && el.children.length === 0
+            );
+            
+            if (!usedTab) {
+                log('QwenWork: "已使用" button not found');
+                return;
             }
-        } catch (e) {
-            log('Token fetch failed:', e);
-        }
-
-        // 用 token 查询用量数据
-        try {
-            const body = token ? { token: token } : {};
-            const resp = await fetch(usageUrl, {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-            if (resp.ok) {
-                const data = await resp.json();
-                log('Usage API response:', data.code, Object.keys(data));
-                if (data && (data.code === 0 || data.code === undefined)) {
-                    DataStore.mergeApiResponse(usageUrl, data);
+            
+            // 向上查找包含数据列表的容器（找到有足够多子元素的祖先）
+            let dataContainer = usedTab.parentElement;
+            for (let depth = 0; depth < 15; depth++) {
+                if (!dataContainer || dataContainer === document.body) break;
+                // 检查这个容器是否包含日期格式的记录
+                const containerText = dataContainer.innerText || '';
+                if (/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(containerText) && containerText.length > 100) {
+                    log('QwenWork: Found data container at depth', depth, 'tag:', dataContainer.tagName, 'class:', (dataContainer.className || '').substring(0, 60));
+                    break;
+                }
+                dataContainer = dataContainer.parentElement;
+            }
+            
+            const containerText = dataContainer ? (dataContainer.innerText || '') : '';
+            const lines = containerText.split('\n').map(l => l.trim()).filter(l => l);
+            log('QwenWork: Container lines:', lines.length, 'First 15:', lines.slice(0, 15));
+            
+            // 查找积分历史记录（格式：时间、来源、详情、积分变更）
+            const records = [];
+            for (let i = 0; i < lines.length; i++) {
+                if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/.test(lines[i])) {
+                    const time = lines[i];
+                    const source = lines[i + 1] || '';
+                    const detail = lines[i + 2] || '';
+                    const change = lines[i + 3] || '';
+                    const creditChange = parseFloat(change.replace(/,/g, ''));
+                    if (!isNaN(creditChange)) {
+                        records.push({ time, source, detail, credits: creditChange });
+                    }
                 }
             }
-        } catch (e) {
-            log('Usage fetch failed:', e);
+            
+            log('QwenWork: Extracted', records.length, 'records from DOM');
+            if (records.length > 0) {
+                log('QwenWork: Sample records:', JSON.stringify(records.slice(0, 3)));
+                
+                const sessions = records
+                    .filter(r => r.credits < 0)
+                    .map(r => ({
+                        model_name: r.source || '未知模型auto',
+                        session_name: r.detail || '',
+                        usage_time: r.time,
+                        credits: Math.abs(r.credits),
+                        credit_type: 'consumed'
+                    }));
+                
+                DataStore.sessions = sessions;
+                DataStore.lastUpdated = new Date().toISOString();
+                log('QwenWork: Sessions stored:', sessions.length);
+            } else {
+                log('QwenWork: No records found, will retry after 5s...');
+                setTimeout(() => {
+                    log('QwenWork: Retrying DOM extraction...');
+                    fetchUsageData();
+                }, 5000);
+            }
+            
+            // 查找积分信息
+            const bodyText = document.body.innerText;
+            const creditMatch = bodyText.match(/剩余可用[\s\S]*?([\d,]+\.\d+)/);
+            if (creditMatch) {
+                log('QwenWork: Remaining credits:', creditMatch[1]);
+            }
+            const dailyMatch = bodyText.match(/剩余\s+([\d.]+)\s*$/m);
+            if (dailyMatch) {
+                log('QwenWork: Daily remaining:', dailyMatch[1]);
+            }
+            
+            // API 全部 404，不再尝试
+            log('QwenWork: API attempts skipped (all return 404)');
+        } else {
+            // Trae 后备方案
+            const usageUrl = 'https://api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session';
+            const tokenUrl = 'https://api.trae.cn/cloudide/api/v3/common/GetUserToken';
+
+            // 先尝试获取用户 token
+            let token = null;
+            try {
+                const tokenResp = await fetch(tokenUrl, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                if (tokenResp.ok) {
+                    const tokenData = await tokenResp.json();
+                    token = tokenData;
+                    log('Got token:', tokenData);
+                }
+            } catch (e) {
+                log('Token fetch failed:', e);
+            }
+
+            // 用 token 查询用量数据
+            try {
+                const body = token ? { token: token } : {};
+                const resp = await fetch(usageUrl, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    log('Usage API response:', data.code, Object.keys(data));
+                    if (data && (data.code === 0 || data.code === undefined)) {
+                        DataStore.mergeApiResponse(usageUrl, data);
+                    }
+                }
+            } catch (e) {
+                log('Usage fetch failed:', e);
+            }
         }
         renderDashboard();
     }
@@ -962,7 +1221,7 @@
 
         const check = () => {
             const data = DataStore.get();
-            const sessions = data.usage_sessions || [];
+            const sessions = DataStore.sessions || data.usage_sessions || [];
             const hasData = sessions.length > 0;
 
             if (hasData) {
@@ -976,8 +1235,8 @@
                 log('Triggering API calls by clicking buttons...');
                 triggerApiCalls();
             }
-            if (retries === 10) {
-                log('Trying active fetch...');
+            if (retries === 5) {
+                log('Trying active fetch / DOM extraction...');
                 fetchUsageData().then(() => {
                     renderDashboard();
                 });
@@ -1000,7 +1259,7 @@
             if (!document.getElementById('trae-enhancer-root')) {
                 // 容器被移除了，重新渲染
                 const data = DataStore.get();
-                if ((data.usage_sessions || []).length > 0) {
+                if ((DataStore.sessions || data.usage_sessions || []).length > 0) {
                     renderDashboard();
                 }
             }
