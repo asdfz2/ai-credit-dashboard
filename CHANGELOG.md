@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.7.0] - 2026-08-20
+
+### Added
+
+- QwenWork DOM 多页翻页：自动检测翻页控件（Ant Design/Element UI/自定义），遍历所有页提取积分消耗记录。
+- 过期积分标识：模型名称为空、"—"、"-" 或 "--" 时统一显示为"过期积分"。
+
+### Fixed
+
+- 修复 Tampermonkey 沙箱中 `new MouseEvent` 构造失败导致脚本中断的问题，改用原生 `element.click()`。
+
+### Changed
+
+- 代码优化：删除未使用的 API_CONFIG 字段、死函数、死 CSS 类；简化 `isTraeApi` 为数组 `some()`；清理冗余注释，总代码量减少约 13%。
+
 ## [1.6.2] - 2026-08-16
 
 ### Added
