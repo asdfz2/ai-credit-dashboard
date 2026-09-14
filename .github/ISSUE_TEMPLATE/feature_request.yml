@@ -1,0 +1,30 @@
+name: 💡 功能建议
+description: 提出新功能或对现有功能的改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 相关平台
+      options:
+        - 通用（所有平台）
+        - Trae
+        - QwenWork
+        - WorkBuddy
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 先说场景与困扰，再说期望的呈现方式
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 设想的方案
+      description: 如果有参考样式或其它脚本的类似实现，欢迎附上

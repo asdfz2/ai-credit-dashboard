@@ -1,0 +1,71 @@
+name: 🐛 问题反馈
+description: 报告脚本在某平台上的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提问前请先确认：
+
+        - 使用的是最新版本（面板右上角徽标会显示版本号）；
+        - 已经尝试过面板底部的「重置本页数据」并重新采集；
+        - 浏览器控制台（F12）中没有脚本管理器自身的报错。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 出问题的平台
+      options:
+        - Trae（www.trae.cn/dashboard）
+        - QwenWork（qwenwork.cn/app/settings/usage）
+        - WorkBuddy（www.workbuddy.cn/profile/plans-usage）
+        - 多个平台 / 其它
+    validations:
+      required: true
+
+  - type: dropdown
+    id: manager
+    attributes:
+      label: 脚本管理器
+      description: 不同管理器的存储实现差异较大，此项有助于定位
+      options:
+        - Tampermonkey
+        - ScriptCat（脚本猫）
+        - 其它（请在下方说明）
+    validations:
+      required: true
+
+  - type: input
+    id: script-version
+    attributes:
+      label: 脚本版本
+      description: 面板右上角徽标显示的版本号，例如 1.11.1
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: 浏览器及版本
+      placeholder: 例如 Chrome 128 / Edge 127
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤与现象
+      description: |
+        依次做了什么、看到了什么、期望看到什么。
+        如果涉及数字错误，请同时贴出页面上实际显示的用量明细。
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: 诊断信息
+      description: |
+        点击面板底部的「复制诊断信息」，把剪贴板内容粘贴到这里。
+        只包含用量元数据（时间 / 来源 / 详情标题 / 积分数），不含对话内容；若介意可删去「详情」一列。

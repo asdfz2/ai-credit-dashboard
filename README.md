@@ -1,5 +1,10 @@
 # Trae / QwenWork / WorkBuddy 用量仪表盘增强
 
+![Version](https://img.shields.io/github/v/release/asdfz2/Trae_Qwen-dashboard-enhancer)
+![License](https://img.shields.io/github/license/asdfz2/Trae_Qwen-dashboard-enhancer)
+![平台](https://img.shields.io/badge/平台-Trae%20%7C%20QwenWork%20%7C%20WorkBuddy-blue)
+![管理器](https://img.shields.io/badge/管理器-Tampermonkey%20%7C%20ScriptCat-orange)
+
 为 [Trae](https://www.trae.cn)、[QwenWork](https://qwenwork.cn) 与 [WorkBuddy](https://www.workbuddy.cn) 的用量页面添加增强统计功能的油猴脚本。脚本通过拦截页面 API 请求或从 DOM 提取数据，在页面内输出总积分消耗、模型分布、使用端分布与近 7 天消耗趋势。
 
 只做浏览器端的数据展示增强：不修改任何服务器数据，不上传任何数据。
