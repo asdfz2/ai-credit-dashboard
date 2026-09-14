@@ -1,7 +1,7 @@
 # Trae / QwenWork / WorkBuddy 用量仪表盘增强
 
-![Version](https://img.shields.io/github/v/release/asdfz2/Trae_Qwen-dashboard-enhancer)
-![License](https://img.shields.io/github/license/asdfz2/Trae_Qwen-dashboard-enhancer)
+![Version](https://img.shields.io/github/v/release/asdfz2/ai-credit-dashboard)
+![License](https://img.shields.io/github/license/asdfz2/ai-credit-dashboard)
 ![平台](https://img.shields.io/badge/平台-Trae%20%7C%20QwenWork%20%7C%20WorkBuddy-blue)
 ![管理器](https://img.shields.io/badge/管理器-Tampermonkey%20%7C%20ScriptCat-orange)
 
@@ -60,7 +60,7 @@
 
 2. 点击下方链接直接安装：
 
-   [直接安装脚本](https://raw.githubusercontent.com/asdfz2/Trae_Qwen-dashboard-enhancer/main/trae-dashboard-enhancer.user.js)
+   [直接安装脚本](https://raw.githubusercontent.com/asdfz2/ai-credit-dashboard/main/trae-dashboard-enhancer.user.js)
 
 3. 或者复制 `trae-dashboard-enhancer.user.js` 的内容，在脚本管理器中新建脚本并保存。
 
@@ -158,7 +158,7 @@
 
 ## 贡献
 
-欢迎通过 [Issues](https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer/issues) 提交反馈或建议。
+欢迎通过 [Issues](https://github.com/asdfz2/ai-credit-dashboard/issues) 提交反馈或建议。
 
 ## 许可证
 

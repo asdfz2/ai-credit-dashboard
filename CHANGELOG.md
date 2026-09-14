@@ -17,6 +17,7 @@
 
 ### Note
 
+- 仓库更名为 **`ai-credit-dashboard`**（原名 `Trae_Qwen-dashboard-enhancer`）。脚本 `@namespace` 刻意保持不变：脚本管理器以 namespace + name 识别脚本，改掉它会导致已安装用户出现新旧两个脚本并存。`@downloadURL` / `@updateURL` 已指向新地址，旧地址由 GitHub 重定向兜底，已安装用户无感。
 - 本版本起明确支持 Tampermonkey 与 ScriptCat 两个脚本管理器。脚本仅使用标准 GM API（`GM_getValue` / `GM_setValue` / `GM_addStyle`），未依赖任何 Tampermonkey 专有行为。
 
 ## [1.10.4] - 2026-09-14

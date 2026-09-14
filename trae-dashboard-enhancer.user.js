@@ -1,14 +1,16 @@
 // ==UserScript==
 // @name         Trae / QwenWork / WorkBuddy 用量仪表盘增强
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
+//               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
+//                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
 // @version      1.11.1
 // @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、使用端分布与近 7 天趋势
 // @author       asdfz2
 // @license      MIT
-// @homepage     https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
-// @supportURL   https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer/issues
-// @downloadURL  https://raw.githubusercontent.com/asdfz2/Trae_Qwen-dashboard-enhancer/main/trae-dashboard-enhancer.user.js
-// @updateURL    https://raw.githubusercontent.com/asdfz2/Trae_Qwen-dashboard-enhancer/main/trae-dashboard-enhancer.user.js
+// @homepage     https://github.com/asdfz2/ai-credit-dashboard
+// @supportURL   https://github.com/asdfz2/ai-credit-dashboard/issues
+// @downloadURL  https://raw.githubusercontent.com/asdfz2/ai-credit-dashboard/main/trae-dashboard-enhancer.user.js
+// @updateURL    https://raw.githubusercontent.com/asdfz2/ai-credit-dashboard/main/trae-dashboard-enhancer.user.js
 // @match        https://www.trae.cn/dashboard*
 // @match        https://trae.cn/dashboard*
 // @match        https://qwenwork.cn/app/settings/usage*
