@@ -3,3 +3,6 @@ GitHub.txt
 
 # 计划文件，不上传
 .trae/
+
+# 本地工作数据与记忆，不上传
+.workbuddy/
