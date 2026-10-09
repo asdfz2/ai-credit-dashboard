@@ -31,6 +31,7 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 | `normalize(raw)` | 把平台原始记录转成统一字段 |
 | `continueBody(body, page)` | 构造下一页请求体 |
 | `defaultBody()` | 拦截未命中时主动采集所用的默认参数 |
+| `rangeFields(startDay, endDay)` | 按区间补拉时的起止字段名与格式（Trae `start_time` / `end_time`，WorkBuddy `startTime` / `endTime`）；缺省表示该平台没有可用的区间接口 |
 | `extras(payload, store)` | 平台特有的附加信息（如 Trae 的权益包） |
 | `postFetch()` | 首次采集方式。有此项则以它为主（QwenWork），否则走主动 API 采集 |
 | `note` | 面板底部的口径说明 |
@@ -44,8 +45,8 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 1. `init()` 安装 `fetch` / `XMLHttpRequest` 拦截器，等待页面加载后渲染面板，并启动 DOM 监听。
 2. 命中 `watchApi` 的响应交给 `mergePayload()`：解析 → 归一化 → 按记录 ID 去重合并 → 落盘。
 3. `computePagination()` 由请求体中的分页参数（`pageNum` / `page_num` / `page`）与接口给出的总条数推导总页数；总页数大于当前页时，`fetchAllPages()` 自动拉取剩余分页，每页间隔 300ms。
-4. `computeStats()` 基于会话数据计算总消耗、今日、近 7 天、本月、模型分布、使用端分布与每日趋势。
-5. `renderDashboard()` 按数据指纹判断是否需要重绘，把统计结果渲染为卡片、条形图和柱状图。
+4. `computeStats()` 基于会话数据计算总消耗、今日、近 7 天、本月、模型分布、使用端分布与每日趋势；选中区间时改为区间的同一组指标。
+5. `renderDashboard()` 按数据指纹判断是否需要重绘，把统计结果渲染为卡片、条形图和柱状图。指纹里带上区间签名与记录条数，因此「切到一个同样没有数据的区间」也会重绘。
 
 ### Trae 路径
 
@@ -74,6 +75,29 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 3. 首次进入页面时 `bootstrapPlatform()` 主动请求最近 30 天、`pageSize=200` 的数据；页面自身发起的请求（默认 7 天）也会被合并，因此面板覆盖的是两者的并集。
 4. 自动翻页沿用原请求的 `pageSize`——改 `pageSize` 会同时改变偏移量，导致中间数据被跳过。
 
+## 日期范围筛选
+
+面板顶部有一行区间控件：预设芯片（近 7 天 / 近 30 天 / 本月 / 全部）+ 两个原生 `date` 输入 + 「应用」。选中区间后**所有指标一起换口径**——卡片、模型分布、使用端分布、趋势图都只统计区间内的记录。
+
+状态与筛选：
+
+- 区间用本地自然日 `'YYYY-MM-DD'` 表示，`start` / `end` 为 `null` 表示该侧不限；`rangeWindow()` 把闭区间日转成「起始日 00:00:00 → 结束日次日 00:00:00」的半开时间窗，与按日聚合的 `dailyMap` 口径一致。
+- `applyRange()` 过滤本地记录；时间解析不出来的记录无法定位到哪一天，只能排除在区间之外，因此单独计数并在区间状态行里说明略过了多少条。
+- 选中区间后卡片换成「区间积分消耗 / 区间日均消耗 / 区间内记录数」，因为今日 / 近 7 天 / 本月这组以当前时刻为基准的卡片会集体变成 0；选「全部」时完全保持 v1.11 的口径不变。
+- 区间跨度超过 31 天时，趋势图按周聚合（`aggregateByWeek()`，周一为周首），避免几百根柱挤在一起。
+
+持久化：区间是**视图偏好**而不是采集结果，所以单独占一个存储键 `<storageKey>_range`，「重置本页数据」清空用量记录时不会连带抹掉用户选的区间。滚动预设只存 preset 标识，每次加载按当天重算起止日——存具体日期的话隔天再打开就是「芯片写着近 7 天、统计的却是昨天那个窗口」；自定义区间则原样存起止日。
+
+按区间补拉：
+
+1. `requestUsageRange()` 先查 `collectedSpan()`（本地最早/最晚记录日）：区间已被本地数据覆盖就不打接口，只做本地筛选。
+2. 需要补拉时，用 `PLATFORM.defaultBody()` 叠上 `PLATFORM.rangeFields(startDay, endDay)`，经 `PLATFORM.continueBody(body, 1)` 构造请求（**沿用页面自己的 `pageSize`**，改 `pageSize` 会同时改变偏移量导致中间数据被跳过），交给共用的 `postUsageRequest()` 发送；分页仍由既有的 `computePagination()` + `fetchAllPages()` 按响应 `total` 自动翻完。
+3. 只填一侧的区间：缺结束日补今天，缺起始日补本地最早记录日。
+4. `waitForPaging()` 轮询内存里的 `_pagingInFlight`，翻完才把状态行从「正在拉取…」换成结果——进度状态不落盘，遵守「翻页状态只放内存」这条既有约束。
+5. QwenWork 没有可用的用量接口（404），`rangeCoverage()` 改为说明区间与本地已采集范围的关系（无交集时说明为什么是 0，早于覆盖范围时说明无法补拉），而不是静默给出 0。
+
+输入不被打断：`renderDashboard()` 在重绘前检查 `isRangeInputFocused()`，用户正在敲日期时跳过重建（整块 `innerHTML` 重写会让输入框失焦）。已合并的数据仍在后台更新，失焦后由输入框的 `blur` 处理补上这一拍重绘。`blur` 回调里之所以要 `setTimeout(…, 0)`：事件触发瞬间 `document.activeElement` 常常还没换走（尤其 Tab 从起始日跳到结束日），当场判断会被那道聚焦保护挡掉，反而永远不重绘。
+
 ## 主要函数
 
 - `DataStore`：读写 `GM_getValue` / `GM_setValue`，按平台存储键隔离。
@@ -82,7 +106,11 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 - `computePagination()`：从请求体与响应推导当前页、每页条数与总页数；接口未给总条数时退化为「自发现翻页」。
 - `setupNetworkInterceptor()`：包装 `window.fetch` 与 `XMLHttpRequest.prototype`，只处理 `watchApi` 命中的请求。
 - `readSession()`：把任意平台的记录对象映射为统一字段（`id / credit / time / model / client`），并在此完成数值转换。
-- `computeStats()`：模型与使用端维度按积分累加；日期维度按「分」（×100 整数）累加进 `dailyMap`，再派生今日 / 近 7 天 / 本月 / 趋势，保证卡片与柱状图整数口径一致。
+- `computeStats()`：模型与使用端维度按积分累加；日期维度按「分」（×100 整数）累加进 `dailyMap`，再派生今日 / 近 7 天 / 本月 / 趋势，保证卡片与柱状图整数口径一致。选中区间时改走区间口径（总数、日均、区间内趋势，跨度过大时按周聚合）。
+- `applyRange()` / `rangeWindow()` / `presetRange()` / `collectedSpan()`：区间筛选的一组——把 `null` 起止日转成时间窗并过滤记录、按 preset 标识重算滚动区间、给出本地已采集的日期范围（决定要不要补拉）。
+- `requestUsageRange()` / `postUsageRequest()` / `waitForPaging()` / `rangeCoverage()`：按区间补拉的一组。主动采集与区间补拉共用同一个 `postUsageRequest()`（此前只有 `bootstrapPlatform()` 用到，两条路径的请求头与错误处理因此不会分叉）；`rangeCoverage()` 给没有接口或数据不在范围内的平台产出解释文案。
+- `rangeControl()` / `applyRangeChoice()` / `bindRangeEvents()` / `rangeStatusLines()`：区间控件的渲染与交互。芯片与「应用」都走 `applyRangeChoice()`——先本地筛选并强制重绘，再按需补拉，所以数字先出来、补到的数据随后并入。
+- `aggregateByWeek()`：把按日序列合并为周一为周首的周序列，供跨度超过 31 天的区间用。
 - `renderDashboard()` / `renderBreakdown()` / `renderTrendChart()`：注入统计卡片、条形图与 7 天趋势图；按 `dataset.renderKey` 跳过无变化的重绘。
 - `renderSubBreakdown()`：为未分类的聚合条目渲染下级明细（原生 `<details>`，默认收起）。展开状态存在内存的 `_openSubs` 集合里，按「平台 + 维度 + 条目」为键，重绘后恢复。
 - `findMountTarget()` / `placePanel()` / `ensureMount()`：定位并校正面板插入点。前两者负责「插到哪里」与「按什么宽度插」，`ensureMount()` 负责 SPA 场景下的懒校正。
@@ -117,8 +145,10 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 各平台的落盘字段：
 
 - Trae：原样保留接口返回的会话对象（`credits_float`、`usage_time`、`model_name`、`session_id`、`usage_group_details` 等），仅剔除 `user_input_preview`（用户输入预览，面板从不展示）。
-- QwenWork：`{session_id, model_name, session_name, usage_time, credits_float}`，`session_id` 由「时间 + 来源 + 详情 + 金额 + 出现序号」构成，确定性生成，跨刷新可稳定去重。
+- QwenWork：`{session_id, model_name, session_name, usage_time, credits_float}`，`session_id` 是「时间 + 来源 + 详情 + 金额」的内容 ID（v1.10.2 起不再带出现序号），确定性生成，跨刷新可稳定去重。
 - WorkBuddy：`{session_id, model_name, usage_time, credits_float, client, purpose}`，不含任何对话内容。
+
+区间筛选状态另存一个键 `<storageKey>_range`，值形如 `{"preset":"7d","start":"2026-10-03","end":"2026-10-09"}`，与用量数据分家（见「日期范围筛选」）。
 
 ## 主题系统
 
@@ -149,6 +179,8 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 一处刻意的偏离：WorkBuddy 的品牌色 `#00C29A` 在白底上的对比度不足以支撑正文级文字，因此**数值文字使用加深后的 `#00836A`**，而用量条等非文字元素仍用品牌色。可读性优先于颜色的逐字对齐。
 
 样式通过 `GM_addStyle` 一次注入。**间距声明必须带 `!important`**（原因见下方「设计取舍」）。
+
+面板根节点声明 `color-scheme`（默认 `dark`，QwenWork / WorkBuddy 两张浅色表里改 `light`）。原因是区间控件用的是**原生 `<input type="date">`**：不声明的话，深色页面里的日期选择器会按宿主的浅色 UA 默认值绘制，弹层与文字配色和面板对不上。用原生控件而不是自造日历，是为了让键盘输入、移动端滚轮选择与本地化格式都由浏览器负责——面板只做统计，不该重写一层日期 UI。
 
 ## 面板挂载
 
@@ -208,6 +240,13 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 - **多级回退**：拦截器可能因页面加载顺序或框架封装方式而漏掉请求，回退策略保证面板不空白。
 - **MutationObserver 重建面板**：Trae 是 SPA，路由切换后注入节点可能被框架清空。
 - **时间范围统一走本地自然日**：今日、近 7 天、本月与趋势图共用 `dailyMap`，避免时间戳阈值与日期字符串过滤混用导致不一致。字符串时间统一转成 ISO 风格再解析，避免 `"YYYY-MM-DD HH:mm:ss"` 在部分环境解析失败。
+- **区间口径要换掉整套卡片，而不是在旁边加一行**：选中区间后若继续显示今日 / 近 7 天 / 本月，这三张卡会集体变成 0，读起来像是统计算错了。因此区间模式换成「区间消耗 / 日均 / 区间内记录数」，而「全部」模式一字不改——已经用惯的用户看不到任何变化。
+- **补拉之前先看本地覆盖**：区间筛选大多是对已有数据的重新切片，直接打接口会把一次点击变成几十次分页请求。只有在本地采集范围确实盖不住所选区间时才补拉，且沿用页面原有的 `pageSize`（改 `pageSize` 等于改偏移量，会跳过中间页）。
+- **补拉进度只写状态行，不写存储**：进度是「这一刻」的事实，落盘后就成了过期的假状态；沿用既有的内存态 `_pagingInFlight` 轮询到结束即可。
+- **无接口的平台要说清区间落在哪**：QwenWork 只能筛本地已采集的记录，区间超出覆盖范围时给 0 是正确的，但对用户是误导。因此把「与本地记录没有交集」「这段历史无法补拉」写进状态行，而不是静默显示 0。
+- **长区间按周聚合，短标签按密度收起**：31 天以上的区间用日出柱会挤成一片，数值与日期标签互相压。超过 31 天走 `aggregateByWeek()`，柱数超过 12 根收起数值标签、超过 20 根再隔柱收起日期标签，日期与精确数值改由每根柱的 `title` 给出——信息不丢，只是不再常驻。
+- **重绘让位于正在输入的日期**：整块 `innerHTML` 重写会把敲到一半的输入框连焦点一起清掉。数据照常合并，只把这一拍重绘推迟到失焦之后；推迟的判定必须放到 `setTimeout(…, 0)` 里，因为 `blur` 事件触发时 `activeElement` 常常还没换走。
+- **区间是视图偏好，与采集数据分键存放**：「重置本页数据」清的是可重建的采集结果，不该顺手清掉用户选的区间；分键之后两者的生命周期各归各。
 
 ## 已知限制
 
@@ -215,6 +254,8 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 - WorkBuddy 依赖 `/billing/meter/get-user-request-usage` 的字段结构；该接口返回的 `input` 字段属于内部实现细节，若官方移除不影响脚本。
 - 对全局 `fetch` 和 `XMLHttpRequest` 做了 monkey-patch，若目标页面升级后依赖原始函数身份，可能需要调整。
 - QwenWork 的 DOM 提取依赖页面文本结构，若 QwenWork 调整用量页面布局，提取逻辑需要同步更新。
-- WorkBuddy 主动采集固定取最近 30 天，更早的历史不会进入面板。
+- WorkBuddy 首次进入只主动拉最近 30 天，更早的历史要靠区间控件选一段区间触发补拉；能补到多早取决于服务端对历史区间的保留策略，接口对早区间返回空时面板只会如实显示 0。
+- 区间补拉假设用量接口接受任意 `start/end` 区间并给出准确的 `total`。官方若改成限死跨度（例如一次最多 31 天），需要把 `requestUsageRange()` 改成分段请求。
 - Trae 的会话对象不含 `session_name`（2026-09-13 实测），因此「模型桶 → 按详情细分」这一维度在 Trae 上不可用；该平台目前也不会出现未分类的模型桶，故不渲染折叠控件。若将来出现 `-` 或空模型名的记录，需要考虑改用 `usage_group_details[].model_display_name` 作为下级维度。
-- 当前没有自动化测试，改动后建议在三个平台的真实用量页面各做一次回归。回归重点是三条恒等式：总积分 = 各模型之和、近 7 天 = 趋势柱之和、今日 = 趋势图末柱。
+- **验证方式**：仓库里没有常驻测试。改动后跑两段临时校验——把常量区、区间状态与统计函数切出来做数值断言的切片脚本（34 项），以及用 jsdom 真实加载整个 user.js、配假接口与 GM 桩的四场景 DOM 脚本（58 项，覆盖区间芯片、自定义区间、补拉分页请求体、覆盖提示、输入不被重绘打断、SPA 离开/回来、老用户无区间存储）。jsdom 没有真实排版，**视觉层面的东西仍只能在三个已登录页面人眼过一遍**：密集趋势的标签是否真的不互相压、原生日期选择器在深色面板里的配色、以及面板宽度与页面内容列的对齐。
+- 回归时的三条恒等式不变：总积分 = 各模型之和、区间内（或近 7 天）= 趋势柱之和、今日 = 趋势图末柱；选中区间后再加上「区间卡片 = 各模型之和」一条。
