@@ -1776,10 +1776,18 @@
             return lines;
         }
 
+        // 原生 date 的区间界：给了它就把界外的日子置灰，输入框为空时日历
+        // 还会直接开到界内的那个月，用户不必逐月翻页去找
+        const dateBound = (name, value) =>
+            (value ? ' ' + name + '="' + escapeHtml(value) + '"' : '');
+
         /**
          * 区间选择控件：预设芯片 + 自定义起止日期。
          * 选中的区间决定统计用的数据集——卡片、模型分布、使用端分布与趋势都按它过滤。
+         * 起止互设界：起始日的 max = 结束日，结束日的 min = 起始日——先选哪一侧，
+         * 另一侧的可选范围就以它为准，日历面板随之开到最近可选的月份。
          */
+
         function rangeControl(statusLines) {
             const chips = RANGE_PRESETS.map((p) => {
                 const active = _range.preset === p.id;
@@ -1797,10 +1805,12 @@
                 '<span class="tee-range-title">统计区间</span>' +
                 '<span class="tee-range-chips">' + chips + '</span>' +
                 '<span class="tee-range-custom">' +
-                '<input class="tee-date tee-date-start" type="date" aria-label="起始日期" value="' +
+                '<input class="tee-date tee-date-start" type="date" aria-label="起始日期"' +
+                dateBound('max', _rangeDraft.end) + ' value="' +
                 escapeHtml(_rangeDraft.start) + '">' +
                 '<span class="tee-range-dash">至</span>' +
-                '<input class="tee-date tee-date-end" type="date" aria-label="结束日期" value="' +
+                '<input class="tee-date tee-date-end" type="date" aria-label="结束日期"' +
+                dateBound('min', _rangeDraft.start) + ' value="' +
                 escapeHtml(_rangeDraft.end) + '">' +
                 '<button type="button" class="tee-btn tee-range-apply">应用</button>' +
                 '</span>' +
@@ -1819,6 +1829,29 @@
             if (next.start || next.end) requestUsageRange(next);
         }
 
+        /**
+         * 一侧的日期改动后，把另一侧顶进合法范围，再刷新两头的 min / max。
+         * 以刚改的这一侧为准：另一侧落到了界外就顶到最近的合法日期——也就是同一天，
+         * 得到一个单点区间而不是一句报错。日历里选不出界外的日子，但手输在部分宿主上
+         * 能绕过 min / max，所以这道兜底和那两个属性都要留着。
+         */
+        function constrainRangeInput(container, changed) {
+            const start = _rangeDraft.start || '';
+            const end = _rangeDraft.end || '';
+            // 'YYYY-MM-DD' 定长零填充，字典序即日期序
+            if (start && end && start > end) {
+                const other = changed === 'start' ? 'end' : 'start';
+                const picked = _rangeDraft[changed];
+                _rangeDraft[other] = picked;
+                const otherEl = container.querySelector(other === 'start' ? '.tee-date-start' : '.tee-date-end');
+                if (otherEl) otherEl.value = picked;
+            }
+            const startEl = container.querySelector('.tee-date-start');
+            const endEl = container.querySelector('.tee-date-end');
+            if (startEl) startEl.max = _rangeDraft.end || '';
+            if (endEl) endEl.min = _rangeDraft.start || '';
+        }
+
         // 事件在每次重绘后重新绑定（innerHTML 会换掉整棵子树）
         function bindRangeEvents(container) {
             container.querySelectorAll('.tee-chip').forEach((btn) => {
@@ -1830,8 +1863,12 @@
             [['.tee-date-start', 'start'], ['.tee-date-end', 'end']].forEach((pair) => {
                 const el = container.querySelector(pair[0]);
                 if (!el) return;
-                // 输入即时记入草稿，这样面板因数据更新而重绘时不会丢掉未点「应用」的内容
-                el.addEventListener('input', () => { _rangeDraft[pair[1]] = el.value || ''; });
+                // 输入即时记入草稿，这样面板因数据更新而重绘时不会丢掉未点「应用」的内容；
+                // 同时把另一侧顶进合法范围，日历面板随之开到最近可选的月份
+                el.addEventListener('input', () => {
+                    _rangeDraft[pair[1]] = el.value || '';
+                    constrainRangeInput(container, pair[1]);
+                });
                 el.addEventListener('blur', () => {
                     // blur 事件触发时 activeElement 常常还没换走（尤其是从起始日 Tab 到结束日），
                     // 直接在事件里重绘会被上面那道聚焦保护挡掉。放到下一拍判断：
