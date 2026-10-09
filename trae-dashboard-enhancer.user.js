@@ -433,6 +433,11 @@
         // 靠它把用户已输入但尚未点「应用」的内容还原回去
         let _rangeDraft = { start: '', end: '' };
 
+        // 存储里的起止日只接受形状正确的值。这不是防御外部输入——这个键只有脚本自己写——
+        // 而是手改过的存储会把任意字符串同时送进属性拼接与补拉请求体，而原生 date 输入框
+        // 本来也放不下这种值，不如直接按「该侧不限」处理
+        const safeDay = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
+
         function loadRange() {
             let saved = null;
             try {
@@ -445,7 +450,11 @@
             if (isRollingPreset(preset)) {
                 _range = presetRange(preset);
             } else if (preset === RANGE_CUSTOM) {
-                _range = { preset: RANGE_CUSTOM, start: saved.start || null, end: saved.end || null };
+                const start = safeDay(saved.start);
+                const end = safeDay(saved.end);
+                // 两侧都不合法（或被清空）时不保留 custom 标识：那样既没有芯片高亮，
+                // 又没有区间可显示，等于渲染一个谁也读不懂的中间态
+                _range = (start || end) ? { preset: RANGE_CUSTOM, start: start, end: end } : presetRange('all');
             } else {
                 _range = presetRange('all');
             }
