@@ -1833,7 +1833,12 @@
                 // 输入即时记入草稿，这样面板因数据更新而重绘时不会丢掉未点「应用」的内容
                 el.addEventListener('input', () => { _rangeDraft[pair[1]] = el.value || ''; });
                 el.addEventListener('blur', () => {
-                    if (!_rangeHint.active) renderDashboard();
+                    // blur 事件触发时 activeElement 常常还没换走（尤其是从起始日 Tab 到结束日），
+                    // 直接在事件里重绘会被上面那道聚焦保护挡掉。放到下一拍判断：
+                    // 换到另一个日期框时仍然不打断，离开控件后才补上被推迟的重绘
+                    setTimeout(() => {
+                        if (!_rangeHint.active) renderDashboard();
+                    }, 0);
                 });
             });
 
