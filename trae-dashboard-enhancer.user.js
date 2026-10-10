@@ -2031,9 +2031,12 @@
                     : null,
                 rangeRequest: _lastRangeRequest,
                 daily: daily,
+                // 只导出「时间 | 模型 | 积分」这类元数据。会话详情不进诊断信息——
+                // QwenWork 的详情列就是用户的提问原文，而这段文本是要贴给别人看的，
+                // 截断或打码都仍是把内容带了出去。排查重复/污染靠时间、模型、金额与条数足够了。
                 records: sessions.map((s) => {
                     const rs = readSession(s);
-                    return rs.time + ' | ' + rs.model + ' | ' + rs.detail + ' | ' + rs.credit;
+                    return rs.time + ' | ' + rs.model + ' | ' + rs.credit;
                 })
             }, null, 1);
         }
