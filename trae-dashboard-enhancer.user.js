@@ -2036,7 +2036,12 @@
                 // 截断或打码都仍是把内容带了出去。排查重复/污染靠时间、模型、金额与条数足够了。
                 records: sessions.map((s) => {
                     const rs = readSession(s);
-                    return rs.time + ' | ' + rs.model + ' | ' + rs.credit;
+                    // 时间列统一成本地 'YYYY-MM-DD HH:mm:ss'。Trae 存的是秒级数字，原样导出
+                    // 就是一串裸时间戳（1791345764），与 WorkBuddy / QwenWork 的日期串不是一个形态，
+                    // 贴出来没法读。解析不出时间的记录仍要出现在导出里，否则条数对不上。
+                    const ts = parseTime(rs.time);
+                    const timeLabel = ts ? fmtDateTime(new Date(ts)) : (rs.time || '（无时间）');
+                    return timeLabel + ' | ' + rs.model + ' | ' + rs.credit;
                 })
             }, null, 1);
         }
