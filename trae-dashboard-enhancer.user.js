@@ -3,8 +3,8 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.11.1
-// @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、使用端分布与近 7 天趋势
+// @version      1.12.0
+// @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
 // @homepage     https://github.com/asdfz2/ai-credit-dashboard
@@ -33,7 +33,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.11.1';
+        const VERSION = '1.12.0';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -218,6 +218,13 @@
                     };
                 },
 
+                // 自选区间的起止字段。该接口按本地时间字符串过滤，首尾各取整日边界，
+                // 使「按日筛选」与面板口径一致（含结束日当天）
+                rangeFields: (startDay, endDay) => ({
+                    start_time: startDay + ' 00:00:00',
+                    end_time: endDay + ' 23:59:59'
+                }),
+
                 step: 'click-then-fetch'
             },
 
@@ -302,6 +309,11 @@
                     };
                 },
 
+                rangeFields: (startDay, endDay) => ({
+                    startTime: startDay + ' 00:00:00',
+                    endTime: endDay + ' 23:59:59'
+                }),
+
                 // WorkBuddy 与 CodeBuddy 共用同一账号积分池，明细里会同时出现
                 // WorkBuddy / CLI 等使用端，所以面板口径是账号级。
                 note: '统计口径：账号级用量，含 WorkBuddy / CLI 等全部使用端。数据只存在本机浏览器，不含对话内容。'
@@ -374,6 +386,159 @@
                 return this.sessions().length;
             }
         };
+
+        /* ================================================================== *
+         * 2.1 日期范围筛选状态
+         *     区间用本地自然日 'YYYY-MM-DD' 表示，start / end 为 null 表示该侧不限。
+         *     它是视图偏好而不是采集结果，所以单独占一个存储键：「重置本页数据」
+         *     清空用量记录时不应连带把用户选的区间抹掉。
+         * ================================================================== */
+
+        const RANGE_KEY = PLATFORM.storageKey + '_range';
+
+        // 预设芯片。「近 7 天」这类滚动区间只存 preset 标识，重新计算起止日，
+        // 存具体日期的话隔天再打开就是「芯片写着近 7 天、统计的却是昨天那个窗口」
+        const RANGE_PRESETS = [
+            { id: '7d', label: '近 7 天' },
+            { id: '30d', label: '近 30 天' },
+            { id: 'month', label: '本月' },
+            { id: 'all', label: '全部' }
+        ];
+        // 起止日期由用户手输时的 preset 标识，没有对应芯片，靠状态行显示区间
+        const RANGE_CUSTOM = 'custom';
+
+        const isRollingPreset = (id) => id === '7d' || id === '30d' || id === 'month';
+
+        function presetRange(id) {
+            const now = new Date();
+            const todayStr = fmtDate(now);
+            if (id === '7d' || id === '30d') {
+                const start = new Date(now);
+                start.setDate(start.getDate() - (id === '7d' ? 6 : 29));
+                return { preset: id, start: fmtDate(start), end: todayStr };
+            }
+            if (id === 'month') {
+                return {
+                    preset: id,
+                    start: fmtDate(new Date(now.getFullYear(), now.getMonth(), 1)),
+                    end: todayStr
+                };
+            }
+            return { preset: 'all', start: null, end: null };
+        }
+
+        let _range = { preset: 'all', start: null, end: null };
+
+        // 自定义区间在输入框里的草稿值。面板按数据指纹重绘时会重建 DOM，
+        // 靠它把用户已输入但尚未点「应用」的内容还原回去
+        let _rangeDraft = { start: '', end: '' };
+
+        // 存储里的起止日只接受形状正确的值。这不是防御外部输入——这个键只有脚本自己写——
+        // 而是手改过的存储会把任意字符串同时送进属性拼接与补拉请求体，而原生 date 输入框
+        // 本来也放不下这种值，不如直接按「该侧不限」处理
+        const safeDay = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
+
+        function loadRange() {
+            let saved = null;
+            try {
+                const raw = GM_getValue(RANGE_KEY, '');
+                saved = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null;
+            } catch (e) {
+                saved = null;
+            }
+            const preset = saved && saved.preset;
+            if (isRollingPreset(preset)) {
+                _range = presetRange(preset);
+            } else if (preset === RANGE_CUSTOM) {
+                const start = safeDay(saved.start);
+                const end = safeDay(saved.end);
+                // 两侧都不合法（或被清空）时不保留 custom 标识：那样既没有芯片高亮，
+                // 又没有区间可显示，等于渲染一个谁也读不懂的中间态
+                _range = (start || end) ? { preset: RANGE_CUSTOM, start: start, end: end } : presetRange('all');
+            } else {
+                _range = presetRange('all');
+            }
+            _rangeDraft = { start: _range.start || '', end: _range.end || '' };
+        }
+
+        function saveRange() {
+            try {
+                GM_setValue(RANGE_KEY, JSON.stringify(_range));
+            } catch (e) {
+                warn('区间筛选状态写入失败:', e);
+            }
+        }
+
+        // 渲染指纹与持久化都用这一份签名：区间变了但记录数没变时也要重绘
+        const rangeSignature = () => _range.preset + '|' + (_range.start || '') + '|' + (_range.end || '');
+
+        const rangeLabel = (range) => {
+            if (!range.start && !range.end) return '全部';
+            return (range.start || '不限') + ' ~ ' + (range.end || '不限');
+        };
+
+        /**
+         * 区间对应的时间窗口（毫秒）。起始取当天 00:00:00，结束取次日 00:00:00 的开区间，
+         * 让「含结束日整天」与按日聚合的 dailyMap 口径一致。
+         * @returns {{fromTs:number, toTs:number}|null} 起止都解析不了时返回 null（视为不筛选）
+         */
+        function rangeWindow(range) {
+            const from = range.start ? parseLocalDateKey(range.start) : null;
+            const to = range.end ? parseLocalDateKey(range.end) : null;
+            if (!from && !to) return null;
+            return {
+                fromTs: from ? from.getTime() : -Infinity,
+                toTs: to ? to.getTime() + 86400000 : Infinity
+            };
+        }
+
+        /**
+         * 按区间过滤本地记录。
+         * 时间解析不出来的记录无法定位到哪一天，只能排除在区间统计之外，
+         * 因此单独计数，由面板说明它们被略过的数量。
+         */
+        function applyRange(sessions, range) {
+            const win = rangeWindow(range);
+            if (!win) return { sessions: sessions, skippedNoTime: 0 };
+            const kept = [];
+            let skippedNoTime = 0;
+            sessions.forEach((raw) => {
+                const ts = parseTime(readSession(raw).time);
+                if (ts <= 0) {
+                    skippedNoTime++;
+                    return;
+                }
+                if (ts >= win.fromTs && ts < win.toTs) kept.push(raw);
+            });
+            return { sessions: kept, skippedNoTime: skippedNoTime };
+        }
+
+        // 区间跨度（自然日，闭区间）。结束日按今天封顶：未来日期没有数据，
+        // 计入分母只会把日均摊薄
+        function rangeDayCount(range) {
+            const from = range.start ? parseLocalDateKey(range.start) : null;
+            const to = range.end ? parseLocalDateKey(range.end) : null;
+            if (!from || !to) return 0;
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const endTs = Math.min(to.getTime(), today.getTime());
+            const days = Math.floor((endTs - from.getTime()) / 86400000) + 1;
+            return days > 0 ? days : 0;
+        }
+
+        // 本地记录的起止日，用于判断所选区间是否落在已采集数据之外
+        function collectedSpan(sessions) {
+            let minTs = Infinity;
+            let maxTs = -Infinity;
+            sessions.forEach((raw) => {
+                const ts = parseTime(readSession(raw).time);
+                if (ts <= 0) return;
+                if (ts < minTs) minTs = ts;
+                if (ts > maxTs) maxTs = ts;
+            });
+            if (minTs === Infinity) return null;
+            return { start: fmtDate(new Date(minTs)), end: fmtDate(new Date(maxTs)) };
+        }
 
         /* ================================================================== *
          * 3. 数据合并
@@ -657,8 +822,62 @@
         }
 
         /* ================================================================== *
-         * 5. 主动采集（拦截未命中时的兜底）
+         * 5. 主动采集（拦截未命中时的兜底）与按区间补拉
          * ================================================================== */
+
+        // 区间控件下方那一行提示（补拉进度 / 补拉结果 / 输入校验）。只放内存：
+        // 它描述的是「刚刚发生了什么」，落盘后下次打开会显示一条早已结束的进度
+        let _rangeHint = { active: false, text: '' };
+        // 最近一次区间补拉实际发出的 url 与请求体，同样只放内存。
+        // 诊断信息靠它对照「页面自己发的参数」与「脚本替换后的参数」的形态差异
+        let _lastRangeRequest = null;
+
+        // 用量接口的一次 POST 请求。主动采集与区间补拉共用，请求头复用页面自己发过的
+        // 那一份（鉴权字段是现成的，脚本无从伪造）。
+        // 返回 { ok, reason }：reason 是给用户看的一句话，只描述请求层面发生了什么
+        // （HTTP 状态、接口业务码、异常名），不带响应体——响应体里可能有用户输入。
+        async function postUsageRequest(url, body) {
+            const doFetch = _rawFetch || window.fetch.bind(window);
+            const headers = Object.assign(
+                { 'Content-Type': 'application/json' },
+                sanitizeHeaders(_lastApiRequest.headers)
+            );
+            try {
+                const resp = await doFetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers,
+                    body: JSON.stringify(body)
+                });
+                if (!resp.ok) {
+                    warn('用量请求失败，HTTP ' + resp.status);
+                    return { ok: false, reason: 'HTTP ' + resp.status };
+                }
+                const payload = await resp.json();
+                if (!isSuccessPayload(payload)) {
+                    warn('用量接口返回失败码:', payload && payload.code, payload && payload.msg);
+                    return {
+                        ok: false,
+                        reason: '接口返回 code=' + (payload && payload.code !== undefined ? payload.code : '(无)')
+                    };
+                }
+                mergePayload(url, payload, body);
+                return { ok: true, reason: '' };
+            } catch (e) {
+                warn('用量请求异常:', e);
+                return { ok: false, reason: '请求异常 ' + ((e && e.name) || '') };
+            }
+        }
+
+        // mergePayload 触发的自动翻页是即发即走的，请求方拿不到它的结束时机。
+        // 翻页占位在内存的 _pagingInFlight 里，用它轮询到收敛（每页间隔 300ms，
+        // 单轮上限 100 页，60 秒足够走完一轮）
+        async function waitForPaging(timeoutMs) {
+            const deadline = Date.now() + (timeoutMs || 60000);
+            while (_pagingInFlight.size > 0 && Date.now() < deadline) {
+                await sleep(400);
+            }
+        }
 
         async function bootstrapPlatform() {
             if (PLATFORM.postFetch) {
@@ -686,28 +905,100 @@
             }
 
             log('主动采集:', url, body);
-            try {
-                const doFetch = _rawFetch || window.fetch.bind(window);
-                const headers = Object.assign(
-                    { 'Content-Type': 'application/json' },
-                    sanitizeHeaders(captured ? captured.headers : {})
-                );
-                const resp = await doFetch(url, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers,
-                    body: JSON.stringify(body)
-                });
-                if (!resp.ok) {
-                    warn('主动采集失败，HTTP ' + resp.status);
-                    return;
-                }
-                const payload = await resp.json();
-                mergePayload(url, payload, body);
-                renderDashboard();
-            } catch (e) {
-                warn('主动采集异常:', e);
+            await postUsageRequest(url, body);
+            renderDashboard();
+        }
+
+        /**
+         * 把区间起止值改成页面请求体里同名字段的形态。
+         * 页面自己发出去的那份参数是唯一的格式依据：Trae 记录里的 time 是秒级数字，
+         * 起止字段同样是数字，而 rangeFields 给的是 'YYYY-MM-DD HH:mm:ss' 字符串，
+         * 类型不符时服务端直接拒掉请求（Trae 实测确认后改为此处跟随形态）。
+         * 数字字段按已有值的量级还原成秒或毫秒。
+         */
+        function matchRequestShape(base, injected) {
+            const out = Object.assign({}, injected);
+            Object.keys(injected).forEach((key) => {
+                const existing = base ? base[key] : undefined;
+                if (typeof existing !== 'number') return;
+                const ms = parseTime(injected[key]);
+                if (!ms) return;
+                out[key] = existing > 946684800000 ? ms : Math.floor(ms / 1000);
+            });
+            return out;
+        }
+
+        /**
+         * 按所选区间主动向接口取数（Trae / WorkBuddy）。
+         * 面板默认只覆盖页面自身请求触及的范围（通常最近 30 天），不补拉的话，
+         * 选更早的区间等于在筛一份本来就不存在的数据。
+         * QwenWork 没有可用接口（PLATFORM.rangeFields 缺失），只能筛本地已采集记录。
+         */
+        async function requestUsageRange(range) {
+            if (!PLATFORM.rangeFields || !PLATFORM.apiUrl) return false;
+
+            const span = collectedSpan(DataStore.sessions());
+            // 单侧不限时补一个能请求的边界：结束侧取今天，起始侧取本地已有的最早记录日，
+            // 一条记录都没有就退到最近 30 天——不造跨越上千年的窗口
+            const startDay = range.start ||
+                (span ? span.start : fmtDate(new Date(Date.now() - 29 * 86400000)));
+            const endDay = range.end || fmtDate(new Date());
+
+            // 区间已被本地数据覆盖时不请求：反复点预设会反复打同一个接口
+            if (span && startDay >= span.start && endDay <= span.end) {
+                log('所选区间已被本地数据覆盖，跳过补拉');
+                return false;
             }
+
+            // 有 rangeFields 的平台必然声明了 defaultBody，参数缺失时用它兜底
+            const base = (_lastApiRequest.body && Object.keys(_lastApiRequest.body).length)
+                ? _lastApiRequest.body
+                : PLATFORM.defaultBody();
+
+            // 只替换起止与分页起点，其余参数沿用页面请求体（如 Trae 的 usage_type）。
+            // 每页条数刻意不改：改它会同时改变偏移量，中间的数据会被跳过
+            const injected = PLATFORM.rangeFields(startDay, endDay);
+            const body = PLATFORM.continueBody(
+                Object.assign({}, base, matchRequestShape(base, injected)), 1
+            );
+            const url = _lastApiRequest.url || PLATFORM.apiUrl;
+
+            // 记下这次真正发出去的参数形态，供「复制诊断信息」排查字段格式问题
+            _lastRangeRequest = { url: url, body: body };
+            log('按区间补拉:', url, body);
+            _rangeHint = { active: true, text: '正在拉取 ' + startDay + ' ~ ' + endDay + ' 的分页数据…' };
+            renderDashboard(true);
+            const res = await postUsageRequest(url, body);
+            await waitForPaging();
+            _rangeHint = {
+                active: false,
+                text: res.ok
+                    ? '已按区间补拉，本地共 ' + DataStore.count() + ' 条记录'
+                    : '区间补拉失败（' + res.reason + '），当前数字仅基于本地已采集的记录'
+            };
+            renderDashboard(true);
+            return res.ok;
+        }
+
+        // 所选区间是否超出本地数据覆盖范围，决定面板要不要提示「区间外没有数据」。
+        // 能补拉的平台（有 rangeFields）不在这里提示——补拉结果由 _rangeHint 说明
+        function rangeCoverage(range, sessions) {
+            if (!range.start && !range.end) return null;
+            if (PLATFORM.rangeFields) return null;
+            const span = collectedSpan(sessions);
+            if (!span) return '本地还没有任何用量记录，先在页面上加载一次数据';
+            // 'YYYY-MM-DD' 定长零填充，字典序即日期序，不必再经 Date 解析（避免 UTC 偏移）
+            const fromDay = range.start || span.start;
+            const toDay = range.end || span.end;
+            if (toDay < span.start || fromDay > span.end) {
+                return '所选区间与本地已采集的记录（' + span.start + ' ~ ' + span.end +
+                    '）没有交集，统计为 0';
+            }
+            if (fromDay < span.start) {
+                return '该平台没有可用的用量接口，区间中早于 ' + span.start +
+                    ' 的部分无法补拉，统计只含本地已采集的记录';
+            }
+            return null;
         }
 
         // 通过点击页面上的时间范围按钮，触发页面自己发起用量请求
@@ -1157,7 +1448,40 @@
             return out.length ? out : null;
         }
 
-        function computeStats(sessions, store) {
+        // 趋势的按周聚合：长区间逐日柱子会挤成一团，合并进自然周（周一起始）后
+        // 每根柱子仍代表一段可比的时间
+        function aggregateByWeek(days) {
+            const weeks = [];
+            const index = new Map();
+            days.forEach((d) => {
+                const day = parseLocalDateKey(d.date);
+                if (!day) return;
+                const monday = new Date(day);
+                monday.setDate(day.getDate() - ((day.getDay() + 6) % 7));
+                const key = fmtDate(monday);
+                const existing = index.get(key);
+                if (existing) {
+                    existing.cents += d.cents;
+                    existing.calls += d.calls;
+                    return;
+                }
+                const row = {
+                    date: key,
+                    cents: d.cents,
+                    calls: d.calls,
+                    label: key.substring(5) + ' 周'
+                };
+                index.set(key, row);
+                weeks.push(row);
+            });
+            return weeks.sort((a, b) => a.date.localeCompare(b.date));
+        }
+
+        /**
+         * @param sessions 参与统计的记录（区间模式下已经过 applyRange 过滤）
+         * @param range    当前生效的日期区间；为 null 时按「全部」口径输出今日 / 近 7 天 / 本月
+         */
+        function computeStats(sessions, store, range) {
             const now = new Date();
             const todayStart = new Date(now);
             todayStart.setHours(0, 0, 0, 0);
@@ -1165,6 +1489,7 @@
 
             const sevenDaysStart = new Date(todayStart);
             sevenDaysStart.setDate(sevenDaysStart.getDate() - 6);
+            const sevenDaysStartStr = fmtDate(sevenDaysStart);
 
             const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
             monthStart.setHours(0, 0, 0, 0);
@@ -1281,32 +1606,44 @@
             let todayCents = 0;
             let sevenDaysCents = 0;
             let monthCents = 0;
-            const dailyTrend = [];
+            const allDays = [];
 
             dailyMap.forEach((v, date) => {
                 const day = parseLocalDateKey(date);
                 if (!day) return;
+                allDays.push({ date, cents: v.cents, calls: v.calls });
                 if (date === todayStr) todayCents += v.cents;
-                if (day.getTime() >= sevenDaysStart.getTime()) {
-                    sevenDaysCents += v.cents;
-                    dailyTrend.push({ date, cents: v.cents, calls: v.calls });
-                }
+                if (day.getTime() >= sevenDaysStart.getTime()) sevenDaysCents += v.cents;
                 if (day.getTime() >= monthStart.getTime()) monthCents += v.cents;
             });
-            dailyTrend.sort((a, b) => a.date.localeCompare(b.date));
+            allDays.sort((a, b) => a.date.localeCompare(b.date));
 
-            // 近 7 天没有记录时，趋势图会整块空着，容易被误认为脚本坏了。
-            // 这里退化为「最近有消耗的若干天」，并明确标注真实区间。
+            const rangeActive = !!(range && (range.start || range.end));
+            let dailyTrend = [];
             let trendNote = '';
-            if (dailyTrend.length === 0 && dailyMap.size > 0) {
-                const dates = Array.from(dailyMap.keys()).sort();
-                const tail = dates.slice(-7);
-                tail.forEach((date) => {
-                    const v = dailyMap.get(date);
-                    dailyTrend.push({ date, cents: v.cents, calls: v.calls });
-                });
-                trendNote = '近 7 天没有消耗记录，以下为最近有消耗的 ' + tail.length +
-                    ' 天（' + tail[0] + ' ~ ' + tail[tail.length - 1] + '）';
+
+            if (rangeActive) {
+                // 区间口径：趋势展示区间内每一个有消耗的日子（调用方已按区间过滤），
+                // 不再固定在近 7 天
+                dailyTrend = allDays.slice();
+                if (dailyTrend.length > 31) {
+                    dailyTrend = aggregateByWeek(dailyTrend);
+                    trendNote = '区间内共 ' + allDays.length + ' 天有消耗，趋势已按自然周（周一起始）聚合';
+                }
+            } else {
+                dailyTrend = allDays.filter((d) => d.date >= sevenDaysStartStr);
+                // 近 7 天没有记录时，趋势图会整块空着，容易被误认为脚本坏了。
+                // 这里退化为「最近有消耗的若干天」，并明确标注真实区间。
+                if (dailyTrend.length === 0 && dailyMap.size > 0) {
+                    const dates = allDays.map((d) => d.date);
+                    const tail = dates.slice(-7);
+                    tail.forEach((date) => {
+                        const v = dailyMap.get(date);
+                        dailyTrend.push({ date, cents: v.cents, calls: v.calls });
+                    });
+                    trendNote = '近 7 天没有消耗记录，以下为最近有消耗的 ' + tail.length +
+                        ' 天（' + tail[0] + ' ~ ' + tail[tail.length - 1] + '）';
+                }
             }
 
             // Trae 的权益包金额是「已购买」不是「已消耗」，单独给出，不混进总消耗
@@ -1340,6 +1677,11 @@
                 dailyTrend,
                 trendNote,
                 unparsedTime,
+                rangeActive,
+                rangeText: rangeActive ? rangeLabel(range) : '',
+                // 日均的分母：区间跨度（自然日）。缺侧的区间（只填起始或只填结束）
+                // 给不出跨度，卡片改为只展示区间合计
+                rangeDays: rangeActive ? rangeDayCount(range) : 0,
                 lastUpdate
             };
         }
@@ -1359,14 +1701,23 @@
             const container = getOrCreateContainer();
             if (!container) return;
 
-            const sessions = Array.isArray(store.usage_sessions) ? store.usage_sessions : [];
-            const key = PLATFORM.id + ':' + sessions.length + ':' + ((store.meta && store.meta.lastUpdate) || 0);
+            // 正在输入日期时不重建：整块 innerHTML 重写会让输入框失焦，把用户敲到一半
+            // 的日期打断。数据仍在后台合并，失焦或定时兜底重绘时补上
+            if (!force && isRangeInputFocused(container)) return;
+
+            const allSessions = Array.isArray(store.usage_sessions) ? store.usage_sessions : [];
+            const filtered = applyRange(allSessions, _range);
+            // 指纹必须含区间：切换区间时记录条数可能不变（例如两个都不含数据的区间）
+            const key = PLATFORM.id + ':' + filtered.sessions.length + ':' +
+                ((store.meta && store.meta.lastUpdate) || 0) + ':' + rangeSignature();
             if (!force && container.dataset.renderKey === key) return;
             container.dataset.renderKey = key;
 
-            const stats = computeStats(sessions, store);
+            const stats = computeStats(filtered.sessions, store, _range);
 
-            const trendTitle = stats.trendNote ? '积分消耗趋势（近 7 天无记录）' : '积分消耗趋势（近 7 天）';
+            const trendTitle = stats.rangeActive
+                ? '积分消耗趋势（' + stats.rangeText + '）'
+                : (stats.trendNote ? '积分消耗趋势（近 7 天无记录）' : '积分消耗趋势（近 7 天）');
             const trendBody = renderTrendChart(stats.dailyTrend) +
                 (stats.trendNote ? '<div class="tee-note tee-note-spaced">' + escapeHtml(stats.trendNote) + '</div>' : '');
 
@@ -1392,7 +1743,11 @@
 
             const note = PLATFORM.note || ('统计口径：本地已采集的 ' + PLATFORM.label + ' 用量记录。数据只存在本机浏览器。');
 
-            container.innerHTML = header() + cards(stats) + sections + footer(note, stats);
+            container.innerHTML = header() +
+                rangeControl(rangeStatusLines(stats, filtered, allSessions)) +
+                cards(stats) + sections + footer(note, stats);
+
+            bindRangeEvents(container);
 
             const reloadBtn = container.querySelector('.tee-reload');
             if (reloadBtn) {
@@ -1441,14 +1796,175 @@
                 '</div>';
         }
 
+        // 输入框正被占用时跳过常规重绘，避免打断输入（区间选择本身走强制重绘）
+        function isRangeInputFocused(container) {
+            const el = document.activeElement;
+            return !!(el && el.classList && el.classList.contains('tee-date') && container.contains(el));
+        }
+
+        // 区间控件下方那一行行的说明，按「当前区间 → 数据覆盖 → 统计口径 → 操作结果」排列
+        function rangeStatusLines(stats, filtered, allSessions) {
+            const lines = [];
+            if (stats.rangeActive) {
+                lines.push('当前区间 ' + stats.rangeText + '：区间内 ' + stats.totalSessions +
+                    ' 条，本地已采集 ' + allSessions.length + ' 条');
+            }
+            const coverage = rangeCoverage(_range, allSessions);
+            if (coverage) lines.push(coverage);
+            if (filtered.skippedNoTime > 0) {
+                lines.push('另有 ' + filtered.skippedNoTime +
+                    ' 条记录的时间无法解析，无法判断落在哪一天，未纳入区间统计');
+            }
+            if (_rangeHint.text) lines.push(_rangeHint.text);
+            return lines;
+        }
+
+        // 原生 date 的区间界：给了它就把界外的日子置灰，输入框为空时日历
+        // 还会直接开到界内的那个月，用户不必逐月翻页去找
+        const dateBound = (name, value) =>
+            (value ? ' ' + name + '="' + escapeHtml(value) + '"' : '');
+
+        /**
+         * 区间选择控件：预设芯片 + 自定义起止日期。
+         * 选中的区间决定统计用的数据集——卡片、模型分布、使用端分布与趋势都按它过滤。
+         * 起止互设界：起始日的 max = 结束日，结束日的 min = 起始日——先选哪一侧，
+         * 另一侧的可选范围就以它为准，日历面板随之开到最近可选的月份。
+         */
+
+        function rangeControl(statusLines) {
+            const chips = RANGE_PRESETS.map((p) => {
+                const active = _range.preset === p.id;
+                return '<button type="button" class="tee-chip' + (active ? ' tee-chip-on' : '') +
+                    '" data-preset="' + p.id + '" aria-pressed="' + (active ? 'true' : 'false') + '">' +
+                    escapeHtml(p.label) + '</button>';
+            }).join('');
+            const notes = (statusLines || []).filter(Boolean).map((line) =>
+                '<div class="tee-range-note">' + escapeHtml(line) + '</div>'
+            ).join('');
+
+            return '' +
+                '<div class="tee-range">' +
+                '<div class="tee-range-row">' +
+                '<span class="tee-range-title">统计区间</span>' +
+                '<span class="tee-range-chips">' + chips + '</span>' +
+                '<span class="tee-range-custom">' +
+                '<input class="tee-date tee-date-start" type="date" aria-label="起始日期"' +
+                dateBound('max', _rangeDraft.end) + ' value="' +
+                escapeHtml(_rangeDraft.start) + '">' +
+                '<span class="tee-range-dash">至</span>' +
+                '<input class="tee-date tee-date-end" type="date" aria-label="结束日期"' +
+                dateBound('min', _rangeDraft.start) + ' value="' +
+                escapeHtml(_rangeDraft.end) + '">' +
+                '<button type="button" class="tee-btn tee-range-apply">应用</button>' +
+                '</span>' +
+                '</div>' +
+                (notes ? '<div class="tee-range-notes">' + notes + '</div>' : '') +
+                '</div>';
+        }
+
+        // 应用一个区间选择：本地筛选立即生效，能补拉的平台再按区间向接口取数
+        function applyRangeChoice(next) {
+            _range = next;
+            _rangeDraft = { start: next.start || '', end: next.end || '' };
+            saveRange();
+            _rangeHint = { active: false, text: '' };
+            renderDashboard(true);
+            if (next.start || next.end) requestUsageRange(next);
+        }
+
+        /**
+         * 一侧的日期改动后，把另一侧顶进合法范围，再刷新两头的 min / max。
+         * 以刚改的这一侧为准：另一侧落到了界外就顶到最近的合法日期——也就是同一天，
+         * 得到一个单点区间而不是一句报错。日历里选不出界外的日子，但手输在部分宿主上
+         * 能绕过 min / max，所以这道兜底和那两个属性都要留着。
+         */
+        function constrainRangeInput(container, changed) {
+            const start = _rangeDraft.start || '';
+            const end = _rangeDraft.end || '';
+            // 'YYYY-MM-DD' 定长零填充，字典序即日期序
+            if (start && end && start > end) {
+                const other = changed === 'start' ? 'end' : 'start';
+                const picked = _rangeDraft[changed];
+                _rangeDraft[other] = picked;
+                const otherEl = container.querySelector(other === 'start' ? '.tee-date-start' : '.tee-date-end');
+                if (otherEl) otherEl.value = picked;
+            }
+            const startEl = container.querySelector('.tee-date-start');
+            const endEl = container.querySelector('.tee-date-end');
+            if (startEl) startEl.max = _rangeDraft.end || '';
+            if (endEl) endEl.min = _rangeDraft.start || '';
+        }
+
+        // 事件在每次重绘后重新绑定（innerHTML 会换掉整棵子树）
+        function bindRangeEvents(container) {
+            container.querySelectorAll('.tee-chip').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    applyRangeChoice(presetRange(btn.getAttribute('data-preset')));
+                });
+            });
+
+            [['.tee-date-start', 'start'], ['.tee-date-end', 'end']].forEach((pair) => {
+                const el = container.querySelector(pair[0]);
+                if (!el) return;
+                // 输入即时记入草稿，这样面板因数据更新而重绘时不会丢掉未点「应用」的内容；
+                // 同时把另一侧顶进合法范围，日历面板随之开到最近可选的月份
+                el.addEventListener('input', () => {
+                    _rangeDraft[pair[1]] = el.value || '';
+                    constrainRangeInput(container, pair[1]);
+                });
+                el.addEventListener('blur', () => {
+                    // blur 事件触发时 activeElement 常常还没换走（尤其是从起始日 Tab 到结束日），
+                    // 直接在事件里重绘会被上面那道聚焦保护挡掉。放到下一拍判断：
+                    // 换到另一个日期框时仍然不打断，离开控件后才补上被推迟的重绘
+                    setTimeout(() => {
+                        if (!_rangeHint.active) renderDashboard();
+                    }, 0);
+                });
+            });
+
+            const applyBtn = container.querySelector('.tee-range-apply');
+            if (!applyBtn) return;
+            applyBtn.addEventListener('click', () => {
+                const start = _rangeDraft.start || '';
+                const end = _rangeDraft.end || '';
+                if (!start && !end) {
+                    _rangeHint = { active: false, text: '请先填写起始日或结束日' };
+                    renderDashboard(true);
+                    return;
+                }
+                // 'YYYY-MM-DD' 定长零填充，字典序即日期序
+                if (start && end && start > end) {
+                    _rangeHint = { active: false, text: '起始日不能晚于结束日，区间未变更' };
+                    renderDashboard(true);
+                    return;
+                }
+                applyRangeChoice({
+                    preset: RANGE_CUSTOM,
+                    start: start || null,
+                    end: end || null
+                });
+            });
+        }
+
         function cards(stats) {
-            const items = [
-                ['总积分消耗', formatNumber(stats.totalCredits)],
-                ['今日积分消耗', formatNumber(stats.todayCredits)],
-                ['近 7 天积分消耗', formatNumber(stats.sevenDaysCredits)],
-                ['本月积分消耗', formatNumber(stats.monthCredits)],
-                [PLATFORM.unitLabel + '总数', String(stats.totalSessions)]
-            ];
+            // 区间口径与「全部」口径分开出卡：选中区间后，今日 / 近 7 天 / 本月
+            // 这些以当前时刻为基准的卡片会集体变成 0，读起来像是算错了
+            const items = stats.rangeActive
+                ? [
+                    ['区间积分消耗', formatNumber(stats.totalCredits)],
+                    ['区间内' + PLATFORM.unitLabel + '数', String(stats.totalSessions)]
+                ]
+                : [
+                    ['总积分消耗', formatNumber(stats.totalCredits)],
+                    ['今日积分消耗', formatNumber(stats.todayCredits)],
+                    ['近 7 天积分消耗', formatNumber(stats.sevenDaysCredits)],
+                    ['本月积分消耗', formatNumber(stats.monthCredits)],
+                    [PLATFORM.unitLabel + '总数', String(stats.totalSessions)]
+                ];
+            // 缺侧的区间（只填起始或只填结束）算不出跨度，就不给日均，避免用一个猜出来的分母
+            if (stats.rangeActive && stats.rangeDays > 0) {
+                items.splice(1, 0, ['区间日均消耗', formatNumber(stats.totalCredits / stats.rangeDays)]);
+            }
             if (stats.entitlementCredits > 0) {
                 items.push(['已购权益额度', formatNumber(stats.entitlementCredits)]);
             }
@@ -1487,8 +2003,11 @@
             const daily = {};
             sessions.forEach((s) => {
                 const rs = readSession(s);
-                const day = String(rs.time || '').slice(0, 10);
-                if (!day) return;
+                // Trae 的 time 是秒级数字、WorkBuddy 是时间字符串，直接 slice(0,10) 对前者
+                // 取出来的是整条时间戳（每条记录自成一天）。统一先过 parseTime 再落到本地日
+                const ts = parseTime(rs.time);
+                if (!ts) return;
+                const day = fmtDate(new Date(ts));
                 if (!daily[day]) daily[day] = { sum: 0, count: 0 };
                 daily[day].sum = Math.round((daily[day].sum + rs.credit) * 100) / 100;
                 daily[day].count += 1;
@@ -1500,10 +2019,29 @@
                     ? ((GM_info.scriptHandler || '?') + ' ' + (GM_info.version || '')).trim()
                     : '(未知)',
                 count: sessions.length,
+                range: { preset: _range.preset, start: _range.start, end: _range.end },
+                rangeHint: _rangeHint.text,
+                // 只导出参数形态与请求头的**名称**：请求头的值里是鉴权凭据，不能带出去
+                pageRequest: _lastApiRequest.url
+                    ? {
+                        url: _lastApiRequest.url,
+                        body: _lastApiRequest.body,
+                        headerNames: Object.keys(_lastApiRequest.headers || {})
+                    }
+                    : null,
+                rangeRequest: _lastRangeRequest,
                 daily: daily,
+                // 只导出「时间 | 模型 | 积分」这类元数据。会话详情不进诊断信息——
+                // QwenWork 的详情列就是用户的提问原文，而这段文本是要贴给别人看的，
+                // 截断或打码都仍是把内容带了出去。排查重复/污染靠时间、模型、金额与条数足够了。
                 records: sessions.map((s) => {
                     const rs = readSession(s);
-                    return rs.time + ' | ' + rs.model + ' | ' + rs.detail + ' | ' + rs.credit;
+                    // 时间列统一成本地 'YYYY-MM-DD HH:mm:ss'。Trae 存的是秒级数字，原样导出
+                    // 就是一串裸时间戳（1791345764），与 WorkBuddy / QwenWork 的日期串不是一个形态，
+                    // 贴出来没法读。解析不出时间的记录仍要出现在导出里，否则条数对不上。
+                    const ts = parseTime(rs.time);
+                    const timeLabel = ts ? fmtDateTime(new Date(ts)) : (rs.time || '（无时间）');
+                    return timeLabel + ' | ' + rs.model + ' | ' + rs.credit;
                 })
             }, null, 1);
         }
@@ -1542,6 +2080,12 @@
 
         function renderBreakdown(rows, unitLabel, childLabel) {
             if (!rows.length) {
+                // 区间模式下的空白通常是「这一段时间没有消耗」，不是「没采到数据」，
+                // 两种情况要给不同的话，否则用户会以为脚本坏了
+                if (_range.start || _range.end) {
+                    return '<div class="tee-empty">所选区间 ' + escapeHtml(rangeLabel(_range)) +
+                        ' 内没有消耗记录（点「全部」可查看全部已采集记录）</div>';
+                }
                 return '<div class="tee-empty">暂无数据，请先在 ' + escapeHtml(PLATFORM.label) + ' 产生一次调用</div>';
             }
             const max = Math.max.apply(null, rows.map((r) => r.credits).concat([1]));
@@ -1588,17 +2132,27 @@
 
         function renderTrendChart(trend) {
             if (!trend.length) {
-                return '<div class="tee-empty">暂无趋势数据</div>';
+                return '<div class="tee-empty">' +
+                    ((_range.start || _range.end) ? '所选区间内没有按日消耗记录' : '暂无趋势数据') +
+                    '</div>';
             }
             const max = Math.max.apply(null, trend.map((d) => d.cents).concat([1]));
-            return '<div class="tee-trend">' + trend.map((d) => {
+            // 柱子一多，柱顶的数值标签就会互相压住（标签是绝对定位、不换行的）：
+            // 超过 12 根收起数值标签，数值改由悬停 title 提供；超过 20 根再隔柱隐去日期标签
+            const classes = ['tee-trend'];
+            if (trend.length > 12) classes.push('tee-trend-dense');
+            if (trend.length > 20) classes.push('tee-trend-crowded');
+            return '<div class="' + classes.join(' ') + '">' + trend.map((d) => {
                 const pct = Math.max((d.cents / max) * 100, 1).toFixed(1);
+                const valueText = formatNumber(d.cents / 100) + ' 积分 · ' + d.calls + ' 次';
                 return '' +
                     '<div class="tee-trend-col">' +
-                    '<div class="tee-trend-bar" style="height:' + pct + '%">' +
-                    '<span class="tee-trend-value">' + formatNumber(d.cents / 100) + '</span>' +
+                    '<div class="tee-trend-bar" title="' + escapeHtml(d.date + '：' + valueText) +
+                    '" style="height:' + pct + '%">' +
+                    '<span class="tee-trend-value">' + escapeHtml(formatNumber(d.cents / 100)) + '</span>' +
                     '</div>' +
-                    '<div class="tee-trend-label">' + escapeHtml(d.date.substring(5)) + '</div>' +
+                    // 按周聚合时行内已带好标签（周起始日 + 「周」），不再退回按日的 MM-DD
+                    '<div class="tee-trend-label">' + escapeHtml(d.label || d.date.substring(5)) + '</div>' +
                     '</div>';
             }).join('') + '</div>';
         }
@@ -1805,6 +2359,8 @@
             font-family: var(--tee-font);
             font-size: 14px;
             line-height: 1.6;
+            /* 原生日期控件的日历图标与弹层配色要和面板底色一致，否则深色面板里嵌着白控件 */
+            color-scheme: dark;
         }
 
         #trae-enhancer-root.qwenwork-theme {
@@ -1827,6 +2383,7 @@
             --tee-radius-btn: 999px;
             --tee-font: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
             --tee-value-size: 22px;
+            color-scheme: light;
         }
 
         #trae-enhancer-root.workbuddy-theme {
@@ -1849,6 +2406,7 @@
             --tee-radius-btn: 12px;
             --tee-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
             --tee-value-size: 24px;
+            color-scheme: light;
         }
 
         /* ---------------- 通用组件（全部相对变量书写，不写死颜色） ---------------- */
@@ -1894,6 +2452,92 @@
         #trae-enhancer-root .tee-btn:focus-visible {
             outline: 2px solid var(--tee-accent);
             outline-offset: 2px;
+        }
+
+        /* ---------------- 日期范围筛选 ---------------- */
+
+        #trae-enhancer-root .tee-range {
+            margin: 0 0 14px !important;
+            padding: 10px 12px !important;
+            background: var(--tee-surface);
+            border: 1px solid var(--tee-border);
+            border-radius: var(--tee-radius-in);
+        }
+        #trae-enhancer-root .tee-range-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+        }
+        #trae-enhancer-root .tee-range-title {
+            flex: 0 0 auto;
+            font-size: 12px;
+            color: var(--tee-text-dim);
+        }
+        #trae-enhancer-root .tee-range-chips,
+        #trae-enhancer-root .tee-range-custom {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+        }
+        #trae-enhancer-root .tee-range-custom { margin-left: auto !important; }
+        /* .tee-btn 自带 margin-left:auto（为页头的「刷新页面」而设），这里必须收回来，
+           否则「应用」会被推到最右侧、与结束日期输入框脱开 */
+        #trae-enhancer-root .tee-range-custom .tee-btn { margin-left: 0 !important; }
+        #trae-enhancer-root .tee-range-dash {
+            font-size: 12px;
+            color: var(--tee-text-mute);
+        }
+        #trae-enhancer-root .tee-chip {
+            margin: 0 !important;
+            padding: 4px 10px !important;
+            border: 1px solid var(--tee-border);
+            border-radius: var(--tee-radius-btn);
+            background: transparent;
+            color: var(--tee-text-dim);
+            font-family: inherit;
+            font-size: 12px;
+            line-height: 1.5;
+            cursor: pointer;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        #trae-enhancer-root .tee-chip:hover {
+            background: var(--tee-track);
+            color: var(--tee-text);
+        }
+        /* 当前生效的区间用强调色描边，与「刷新页面」那类动作按钮区分开 */
+        #trae-enhancer-root .tee-chip-on {
+            border-color: var(--tee-accent);
+            background: var(--tee-track);
+            color: var(--tee-accent);
+        }
+        #trae-enhancer-root .tee-date {
+            margin: 0 !important;
+            padding: 4px 8px !important;
+            border: 1px solid var(--tee-border);
+            border-radius: var(--tee-radius-btn);
+            background: transparent;
+            color: var(--tee-text);
+            font-family: inherit;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        #trae-enhancer-root .tee-chip:focus-visible,
+        #trae-enhancer-root .tee-date:focus-visible {
+            outline: 2px solid var(--tee-accent);
+            outline-offset: 1px;
+        }
+        #trae-enhancer-root .tee-range-notes {
+            margin: 8px 0 0 !important;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        #trae-enhancer-root .tee-range-note {
+            font-size: 11px;
+            line-height: 1.6;
+            color: var(--tee-text-mute);
         }
 
         #trae-enhancer-root .tee-stats {
@@ -2070,6 +2714,13 @@
             font-size: 10px;
             color: var(--tee-text-dim);
         }
+        /* 柱数多时收起柱顶数值标签，并把原先为标签预留的顶部留白还给柱子 */
+        #trae-enhancer-root .tee-trend-dense .tee-trend-value { display: none; }
+        #trae-enhancer-root .tee-trend-dense { padding: 4px 0 0 !important; }
+        /* 更密的区间里隔柱隐去日期标签（保留占位，柱子位置不动） */
+        #trae-enhancer-root .tee-trend-crowded .tee-trend-col:nth-child(even) .tee-trend-label {
+            visibility: hidden;
+        }
 
         #trae-enhancer-root .tee-footer {
             margin: 12px 0 0 !important;
@@ -2121,6 +2772,10 @@
             #trae-enhancer-root .tee-count { flex-basis: 52px; }
             #trae-enhancer-root .tee-sub-name { flex-basis: 100px; }
             #trae-enhancer-root .tee-trend { height: 130px; }
+            /* 区间控件在窄屏改为整行换行，自定义日期不再靠 margin-left:auto 顶到右侧 */
+            #trae-enhancer-root .tee-range-row { gap: 6px; }
+            #trae-enhancer-root .tee-range-custom { margin-left: 0 !important; }
+            #trae-enhancer-root .tee-date { padding: 3px 6px !important; }
         }
 
         /* ---------------- 尊重系统的「减少动态效果」设置 ---------------- */
@@ -2130,6 +2785,7 @@
             #trae-enhancer-root .tee-bar,
             #trae-enhancer-root .tee-trend-bar,
             #trae-enhancer-root .tee-btn,
+            #trae-enhancer-root .tee-chip,
             #trae-enhancer-root .tee-sub-summary {
                 transition: none !important;
             }
@@ -2213,6 +2869,7 @@
 
         function init() {
             log('初始化，平台 ' + PLATFORM.id + '，版本 v' + VERSION);
+            loadRange();
             setupNetworkInterceptor();
             waitForDataAndRender();
             observePageChanges();
