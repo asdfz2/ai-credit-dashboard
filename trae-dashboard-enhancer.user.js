@@ -828,9 +828,14 @@
         // 区间控件下方那一行提示（补拉进度 / 补拉结果 / 输入校验）。只放内存：
         // 它描述的是「刚刚发生了什么」，落盘后下次打开会显示一条早已结束的进度
         let _rangeHint = { active: false, text: '' };
+        // 最近一次区间补拉实际发出的 url 与请求体，同样只放内存。
+        // 诊断信息靠它对照「页面自己发的参数」与「脚本替换后的参数」的形态差异
+        let _lastRangeRequest = null;
 
         // 用量接口的一次 POST 请求。主动采集与区间补拉共用，请求头复用页面自己发过的
-        // 那一份（鉴权字段是现成的，脚本无从伪造）
+        // 那一份（鉴权字段是现成的，脚本无从伪造）。
+        // 返回 { ok, reason }：reason 是给用户看的一句话，只描述请求层面发生了什么
+        // （HTTP 状态、接口业务码、异常名），不带响应体——响应体里可能有用户输入。
         async function postUsageRequest(url, body) {
             const doFetch = _rawFetch || window.fetch.bind(window);
             const headers = Object.assign(
@@ -846,14 +851,21 @@
                 });
                 if (!resp.ok) {
                     warn('用量请求失败，HTTP ' + resp.status);
-                    return false;
+                    return { ok: false, reason: 'HTTP ' + resp.status };
                 }
                 const payload = await resp.json();
+                if (!isSuccessPayload(payload)) {
+                    warn('用量接口返回失败码:', payload && payload.code, payload && payload.msg);
+                    return {
+                        ok: false,
+                        reason: '接口返回 code=' + (payload && payload.code !== undefined ? payload.code : '(无)')
+                    };
+                }
                 mergePayload(url, payload, body);
-                return true;
+                return { ok: true, reason: '' };
             } catch (e) {
                 warn('用量请求异常:', e);
-                return false;
+                return { ok: false, reason: '请求异常 ' + ((e && e.name) || '') };
             }
         }
 
@@ -898,6 +910,25 @@
         }
 
         /**
+         * 把区间起止值改成页面请求体里同名字段的形态。
+         * 页面自己发出去的那份参数是唯一的格式依据：Trae 记录里的 time 是秒级数字，
+         * 起止字段同样是数字，而 rangeFields 给的是 'YYYY-MM-DD HH:mm:ss' 字符串，
+         * 类型不符时服务端直接拒掉请求（Trae 实测确认后改为此处跟随形态）。
+         * 数字字段按已有值的量级还原成秒或毫秒。
+         */
+        function matchRequestShape(base, injected) {
+            const out = Object.assign({}, injected);
+            Object.keys(injected).forEach((key) => {
+                const existing = base ? base[key] : undefined;
+                if (typeof existing !== 'number') return;
+                const ms = parseTime(injected[key]);
+                if (!ms) return;
+                out[key] = existing > 946684800000 ? ms : Math.floor(ms / 1000);
+            });
+            return out;
+        }
+
+        /**
          * 按所选区间主动向接口取数（Trae / WorkBuddy）。
          * 面板默认只覆盖页面自身请求触及的范围（通常最近 30 天），不补拉的话，
          * 选更早的区间等于在筛一份本来就不存在的数据。
@@ -926,24 +957,27 @@
 
             // 只替换起止与分页起点，其余参数沿用页面请求体（如 Trae 的 usage_type）。
             // 每页条数刻意不改：改它会同时改变偏移量，中间的数据会被跳过
+            const injected = PLATFORM.rangeFields(startDay, endDay);
             const body = PLATFORM.continueBody(
-                Object.assign({}, base, PLATFORM.rangeFields(startDay, endDay)), 1
+                Object.assign({}, base, matchRequestShape(base, injected)), 1
             );
             const url = _lastApiRequest.url || PLATFORM.apiUrl;
 
+            // 记下这次真正发出去的参数形态，供「复制诊断信息」排查字段格式问题
+            _lastRangeRequest = { url: url, body: body };
             log('按区间补拉:', url, body);
             _rangeHint = { active: true, text: '正在拉取 ' + startDay + ' ~ ' + endDay + ' 的分页数据…' };
             renderDashboard(true);
-            const ok = await postUsageRequest(url, body);
+            const res = await postUsageRequest(url, body);
             await waitForPaging();
             _rangeHint = {
                 active: false,
-                text: ok
+                text: res.ok
                     ? '已按区间补拉，本地共 ' + DataStore.count() + ' 条记录'
-                    : '区间补拉失败，当前数字仅基于本地已采集的记录'
+                    : '区间补拉失败（' + res.reason + '），当前数字仅基于本地已采集的记录'
             };
             renderDashboard(true);
-            return ok;
+            return res.ok;
         }
 
         // 所选区间是否超出本地数据覆盖范围，决定面板要不要提示「区间外没有数据」。
@@ -1969,8 +2003,11 @@
             const daily = {};
             sessions.forEach((s) => {
                 const rs = readSession(s);
-                const day = String(rs.time || '').slice(0, 10);
-                if (!day) return;
+                // Trae 的 time 是秒级数字、WorkBuddy 是时间字符串，直接 slice(0,10) 对前者
+                // 取出来的是整条时间戳（每条记录自成一天）。统一先过 parseTime 再落到本地日
+                const ts = parseTime(rs.time);
+                if (!ts) return;
+                const day = fmtDate(new Date(ts));
                 if (!daily[day]) daily[day] = { sum: 0, count: 0 };
                 daily[day].sum = Math.round((daily[day].sum + rs.credit) * 100) / 100;
                 daily[day].count += 1;
@@ -1982,6 +2019,17 @@
                     ? ((GM_info.scriptHandler || '?') + ' ' + (GM_info.version || '')).trim()
                     : '(未知)',
                 count: sessions.length,
+                range: { preset: _range.preset, start: _range.start, end: _range.end },
+                rangeHint: _rangeHint.text,
+                // 只导出参数形态与请求头的**名称**：请求头的值里是鉴权凭据，不能带出去
+                pageRequest: _lastApiRequest.url
+                    ? {
+                        url: _lastApiRequest.url,
+                        body: _lastApiRequest.body,
+                        headerNames: Object.keys(_lastApiRequest.headers || {})
+                    }
+                    : null,
+                rangeRequest: _lastRangeRequest,
                 daily: daily,
                 records: sessions.map((s) => {
                     const rs = readSession(s);

@@ -31,7 +31,7 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 | `normalize(raw)` | 把平台原始记录转成统一字段 |
 | `continueBody(body, page)` | 构造下一页请求体 |
 | `defaultBody()` | 拦截未命中时主动采集所用的默认参数 |
-| `rangeFields(startDay, endDay)` | 按区间补拉时的起止字段名与格式（Trae `start_time` / `end_time`，WorkBuddy `startTime` / `endTime`）；缺省表示该平台没有可用的区间接口 |
+| `rangeFields(startDay, endDay)` | 按区间补拉时的起止字段名（Trae `start_time` / `end_time`，WorkBuddy `startTime` / `endTime`），给的值是字符串日期，实际发送前由 `matchRequestShape()` 按页面请求体里同名字段的形态改写；缺省表示该平台没有可用的区间接口 |
 | `extras(payload, store)` | 平台特有的附加信息（如 Trae 的权益包） |
 | `postFetch()` | 首次采集方式。有此项则以它为主（QwenWork），否则走主动 API 采集 |
 | `note` | 面板底部的口径说明 |
@@ -91,10 +91,11 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 按区间补拉：
 
 1. `requestUsageRange()` 先查 `collectedSpan()`（本地最早/最晚记录日）：区间已被本地数据覆盖就不打接口，只做本地筛选。
-2. 需要补拉时，用 `PLATFORM.defaultBody()` 叠上 `PLATFORM.rangeFields(startDay, endDay)`，经 `PLATFORM.continueBody(body, 1)` 构造请求（**沿用页面自己的 `pageSize`**，改 `pageSize` 会同时改变偏移量导致中间数据被跳过），交给共用的 `postUsageRequest()` 发送；分页仍由既有的 `computePagination()` + `fetchAllPages()` 按响应 `total` 自动翻完。
+2. 需要补拉时，以页面自身请求体为模板（`_lastApiRequest.body`，没捕获到就用 `PLATFORM.defaultBody()`）叠上 `PLATFORM.rangeFields(startDay, endDay)`，其中起止值先过 `matchRequestShape()`——**按同名字段在模板里的形态还原**：模板给数字就跟着给数字（依量级取秒或毫秒），给字符串才用 `'YYYY-MM-DD HH:mm:ss'`。页面发出去的那份参数是格式的唯一依据；Trae 记录里的 `time` 是秒级数字，固定按字符串发实测会被服务端拒掉。再经 `PLATFORM.continueBody(body, 1)` 构造请求（**沿用页面自己的 `pageSize`**，改 `pageSize` 会同时改变偏移量导致中间数据被跳过），交给共用的 `postUsageRequest()` 发送；分页仍由既有的 `computePagination()` + `fetchAllPages()` 按响应 `total` 自动翻完。
 3. 只填一侧的区间：缺结束日补今天，缺起始日补本地最早记录日。
 4. `waitForPaging()` 轮询内存里的 `_pagingInFlight`，翻完才把状态行从「正在拉取…」换成结果——进度状态不落盘，遵守「翻页状态只放内存」这条既有约束。
 5. QwenWork 没有可用的用量接口（404），`rangeCoverage()` 改为说明区间与本地已采集范围的关系（无交集时说明为什么是 0，早于覆盖范围时说明无法补拉），而不是静默给出 0。
+6. 补拉失败时状态行写清原因（`HTTP 400` / `接口返回 code=1001` / `请求异常 TypeError`）。`postUsageRequest()` 返回 `{ ok, reason }`，reason 只描述请求层面发生了什么、不带响应体。响应 200 但业务码非成功同样判失败：HTTP 层与接口业务层要查的是两头，只写一句「补拉失败」等于把排查推给用户自己开控制台。
 
 输入不被打断：`renderDashboard()` 在重绘前检查 `isRangeInputFocused()`，用户正在敲日期时跳过重建（整块 `innerHTML` 重写会让输入框失焦）。已合并的数据仍在后台更新，失焦后由输入框的 `blur` 处理补上这一拍重绘。`blur` 回调里之所以要 `setTimeout(…, 0)`：事件触发瞬间 `document.activeElement` 常常还没换走（尤其 Tab 从起始日跳到结束日），当场判断会被那道聚焦保护挡掉，反而永远不重绘。
 
@@ -112,7 +113,7 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 - `readSession()`：把任意平台的记录对象映射为统一字段（`id / credit / time / model / client`），并在此完成数值转换。
 - `computeStats()`：模型与使用端维度按积分累加；日期维度按「分」（×100 整数）累加进 `dailyMap`，再派生今日 / 近 7 天 / 本月 / 趋势，保证卡片与柱状图整数口径一致。选中区间时改走区间口径（总数、日均、区间内趋势，跨度过大时按周聚合）。
 - `applyRange()` / `rangeWindow()` / `presetRange()` / `collectedSpan()`：区间筛选的一组——把 `null` 起止日转成时间窗并过滤记录、按 preset 标识重算滚动区间、给出本地已采集的日期范围（决定要不要补拉）。
-- `requestUsageRange()` / `postUsageRequest()` / `waitForPaging()` / `rangeCoverage()`：按区间补拉的一组。主动采集与区间补拉共用同一个 `postUsageRequest()`（此前只有 `bootstrapPlatform()` 用到，两条路径的请求头与错误处理因此不会分叉）；`rangeCoverage()` 给没有接口或数据不在范围内的平台产出解释文案。
+- `requestUsageRange()` / `matchRequestShape()` / `postUsageRequest()` / `waitForPaging()` / `rangeCoverage()`：按区间补拉的一组。`matchRequestShape()` 把 `rangeFields` 给的日期值换成页面请求体里同名字段的形态（数字秒 / 数字毫秒 / 字符串）；主动采集与区间补拉共用同一个 `postUsageRequest()`（此前只有 `bootstrapPlatform()` 用到，两条路径的请求头与错误处理因此不会分叉），它返回 `{ ok, reason }` 供状态行显示失败原因；`rangeCoverage()` 给没有接口或数据不在范围内的平台产出解释文案。
 - `rangeControl()` / `applyRangeChoice()` / `bindRangeEvents()` / `rangeStatusLines()`：区间控件的渲染与交互。芯片与「应用」都走 `applyRangeChoice()`——先本地筛选并强制重绘，再按需补拉，所以数字先出来、补到的数据随后并入。
 - `dateBound()` / `constrainRangeInput()`：起止互限的落地点。前者渲染时写 `min` / `max` 属性，后者在每次 `input` 之后把另一侧顶进合法范围并刷新两侧的界。
 - `aggregateByWeek()`：把按日序列合并为周一为周首的周序列，供跨度超过 31 天的区间用。
@@ -220,7 +221,7 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 面板页脚提供两个自救入口：
 
 - **重置本页数据**：确认后清空当前平台的 `usage_sessions` 并刷新页面，采集流程会重新走一遍。本地数据全部可以由页面重建，因此这是无损操作，用于存储数据异常时的自救。
-- **复制诊断信息**：把本地存储的按日聚合与全部记录的内容明细复制到剪贴板。数据存在油猴的存储里而非页面 localStorage，页面控制台读不到，这个入口是获取报错所需数据的唯一途径（不要求用户打开 DevTools）。
+- **复制诊断信息**：把本地存储的按日聚合与全部记录的内容明细复制到剪贴板。数据存在油猴的存储里而非页面 localStorage，页面控制台读不到，这个入口是获取报错所需数据的唯一途径（不要求用户打开 DevTools）。按日聚合与面板同口径（先 `parseTime()` 再落本地日；原先直接截字符串前 10 位，对 Trae 的秒级数字时间截出来是整条时间戳，每条记录自成一日）。除区间状态与那一行提示原文外，还导出页面自身请求（URL、请求体、**请求头名称**）与最近一次补拉实际发出的请求体，用来对照参数形态差异；请求头的值里是鉴权凭据，刻意不导出——这段文本是要贴给别人看的。
 
 ## 设计取舍
 
