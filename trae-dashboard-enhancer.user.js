@@ -861,8 +861,8 @@
                         reason: '接口返回 code=' + (payload && payload.code !== undefined ? payload.code : '(无)')
                     };
                 }
-                mergePayload(url, payload, body);
-                return { ok: true, reason: '' };
+                const merged = mergePayload(url, payload, body);
+                return { ok: true, reason: '', added: merged ? merged.added : 0 };
             } catch (e) {
                 warn('用量请求异常:', e);
                 return { ok: false, reason: '请求异常 ' + ((e && e.name) || '') };
@@ -970,12 +970,21 @@
             renderDashboard(true);
             const res = await postUsageRequest(url, body);
             await waitForPaging();
-            _rangeHint = {
-                active: false,
-                text: res.ok
-                    ? '已按区间补拉，本地共 ' + DataStore.count() + ' 条记录'
-                    : '区间补拉失败（' + res.reason + '），当前数字仅基于本地已采集的记录'
-            };
+            // 区间内本来就没有记录与补到了新数据是两回事，文案要分开：
+            // 前者是「这段时间没消耗」，后者才是「数据已到位」
+            if (res.ok) {
+                _rangeHint = {
+                    active: false,
+                    text: res.added > 0
+                        ? '已按区间补拉，新增 ' + res.added + ' 条，本地共 ' + DataStore.count() + ' 条记录'
+                        : '该区间内没有消耗记录，本地共 ' + DataStore.count() + ' 条记录'
+                };
+            } else {
+                _rangeHint = {
+                    active: false,
+                    text: '区间补拉失败（' + res.reason + '），当前数字仅基于本地已采集的记录'
+                };
+            }
             renderDashboard(true);
             return res.ok;
         }
