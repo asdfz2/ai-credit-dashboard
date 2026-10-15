@@ -3,7 +3,7 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.13.0
+// @version      1.13.1
 // @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
@@ -33,7 +33,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.13.0';
+        const VERSION = '1.13.1';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -2927,7 +2927,12 @@
         #trae-enhancer-root .tee-tools {
             margin: 10px 0 0 !important;
             display: flex;
-            gap: 14px;
+            /* 允许换行。不给换行时三个按钮被压进同一行、各自缩窄，
+               结果中文在词中间断开（「复制诊断信 / 息」）、备份的时间戳
+               被折成两行——375px 下实测就是这个形态 */
+            flex-wrap: wrap;
+            column-gap: 14px;
+            row-gap: 6px;
             align-items: center;
         }
         #trae-enhancer-root .tee-tool,
@@ -2939,6 +2944,9 @@
             color: var(--tee-text-mute);
             font-family: inherit;
             font-size: 11px;
+            /* 按钮文案是固定字符串，任何宽度下都不该在词中间折行；
+               放不下时交给上面那行换行处理 */
+            white-space: nowrap;
             text-decoration: underline;
             cursor: pointer;
         }
