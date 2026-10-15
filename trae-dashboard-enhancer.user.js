@@ -3,7 +3,7 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.12.0
+// @version      1.13.0
 // @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
@@ -33,7 +33,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.12.0';
+        const VERSION = '1.13.0';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -538,6 +538,114 @@
             });
             if (minTs === Infinity) return null;
             return { start: fmtDate(new Date(minTs)), end: fmtDate(new Date(maxTs)) };
+        }
+
+        /* ================================================================== *
+         * 2.2 重置备份
+         *     「重置本页数据」本质上是一次不可撤销的覆写。本地历史里早于平台保留
+         *     窗口的那部分，页面之后再怎么重新采集也取不回来（补拉同样只能取回
+         *     平台仍然保留的部分），所以重置前先把当前记录整份落到独立存储键，
+         *     作为这一次重置的撤销点。
+         * ================================================================== */
+
+        const BACKUP_KEY = PLATFORM.storageKey + '_backup';
+
+        // 形状不对或条数为空都按「没有备份」处理：这个键只由脚本自己写，
+        // 真读不出来时宁可让页脚少一个按钮，也不要拿一份残缺数据去合并
+        function readBackup() {
+            let raw = '';
+            try {
+                raw = GM_getValue(BACKUP_KEY, '');
+            } catch (e) {
+                warn('重置备份读取失败:', e);
+                return null;
+            }
+            if (!raw) return null;
+            let parsed = null;
+            try {
+                parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+            } catch (e) {
+                warn('重置备份解析失败，按无备份处理:', e);
+                return null;
+            }
+            if (!parsed || typeof parsed !== 'object') return null;
+            if (!Array.isArray(parsed.sessions) || !parsed.sessions.length) return null;
+            return parsed;
+        }
+
+        /**
+         * 写入重置备份。
+         * @returns {boolean} 是否写成功。失败时调用方必须中止重置——没有撤销点的清空
+         *                   不能放行，宁可让用户手动去油猴存储里留一份。
+         */
+        function writeBackup(sessions) {
+            try {
+                GM_setValue(BACKUP_KEY, JSON.stringify({
+                    platform: PLATFORM.id,
+                    version: VERSION,
+                    at: Date.now(),
+                    sessions: sessions
+                }));
+                return true;
+            } catch (e) {
+                fail('重置备份写入失败:', e);
+                return false;
+            }
+        }
+
+        function clearBackup() {
+            try {
+                GM_setValue(BACKUP_KEY, '');
+            } catch (e) {
+                warn('重置备份清除失败:', e);
+            }
+        }
+
+        /**
+         * 把备份合并回当前存储。按记录 ID 去重，且**不覆盖**当前已有的记录：
+         * 备份是重置那一刻的旧值，而重置后重新采集到的同一会话可能已经是更新的
+         * 一次消耗，回退成旧值等于用一次旧数据污染新数据。
+         * @returns {{added:number, total:number, trimmed:boolean}} 补回条数、合并后总数、是否触发上限截断
+         */
+        function restoreBackup(backup) {
+            const store = DataStore.get();
+            if (!Array.isArray(store.usage_sessions)) store.usage_sessions = [];
+
+            const index = new Set();
+            store.usage_sessions.forEach((s) => {
+                const id = readSession(s).id;
+                if (id) index.add(id);
+            });
+
+            let added = 0;
+            backup.sessions.forEach((s) => {
+                if (!s || typeof s !== 'object') return;
+                const id = readSession(s).id;
+                if (!id || index.has(id)) return;
+                index.add(id);
+                store.usage_sessions.push(s);
+                added++;
+            });
+
+            // 备份里的记录接在数组尾部，追加顺序不等于时间顺序（分页会把更早的记录
+            // 接在后面）。上限截断按「丢掉最旧的」执行，所以先按时间排一遍，
+            // 否则 slice(-maxSessions) 丢掉的可能是刚补回来的新记录。
+            const timeOf = (s) => {
+                const t = parseTime(readSession(s).time);
+                return (t > 0) ? t : 0;
+            };
+            store.usage_sessions.sort((a, b) => timeOf(a) - timeOf(b));
+
+            let trimmed = false;
+            if (store.usage_sessions.length > CONFIG.maxSessions) {
+                store.usage_sessions = store.usage_sessions.slice(-CONFIG.maxSessions);
+                trimmed = true;
+            }
+
+            // 不动 store.meta.lastUpdate：它展示的是「数据更新时间」，
+            // 补回一批旧记录不构成数据变新了，改它等于让面板显示一个假的更新时间
+            DataStore.set(store);
+            return { added: added, total: store.usage_sessions.length, trimmed: trimmed };
         }
 
         /* ================================================================== *
@@ -1766,12 +1874,61 @@
             const resetBtn = container.querySelector('.tee-reset');
             if (resetBtn) {
                 resetBtn.addEventListener('click', () => {
-                    // 本地数据全部可以由页面重建：清空后刷新，采集流程会重新走一遍
-                    if (!window.confirm('清空本页已采集的用量数据并重新采集？')) return;
                     const store = DataStore.get();
+                    const count = DataStore.count();
+                    if (count === 0) {
+                        window.alert('本页当前没有已采集的用量数据，无需重置。');
+                        return;
+                    }
+
+                    const prev = readBackup();
+                    const lines = [
+                        '即将清空「' + PLATFORM.label + '」本地已采集的 ' + count + ' 条用量数据，并重新采集一遍。',
+                        '',
+                        resetLossNote(),
+                        '',
+                        prev
+                            ? '注意：已存在 ' + fmtDateTime(new Date(prev.at)) + ' 的备份（' +
+                              prev.sessions.length + ' 条），继续将用当前数据覆盖它。'
+                            : '清空前会自动把这 ' + count + ' 条备份到独立存储键，之后可用页脚的「恢复备份」找回来。'
+                    ];
+                    if (!window.confirm(lines.join('\n'))) return;
+
+                    // 先落备份再清空。顺序反了就等于在一个没有撤销点的清空上继续，
+                    // 而 GM 存储配额不足时 GM_setValue 是会抛的
+                    if (!writeBackup(store.usage_sessions)) {
+                        window.alert('备份写入失败，已取消重置。仍要清空的话，请先在脚本管理器的存储里手动留一份。');
+                        return;
+                    }
+
                     store.usage_sessions = [];
                     DataStore.set(store);
                     window.location.reload();
+                });
+            }
+
+            const restoreBtn = container.querySelector('.tee-restore');
+            if (restoreBtn) {
+                restoreBtn.addEventListener('click', () => {
+                    const backup = readBackup();
+                    if (!backup) {
+                        window.alert('没有可用的重置备份。');
+                        renderDashboard();
+                        return;
+                    }
+                    if (!window.confirm(
+                        '把 ' + fmtDateTime(new Date(backup.at)) + ' 的备份（' + backup.sessions.length +
+                        ' 条）合并回当前数据？\n\n备份里当前没有的记录会被补回；同一条记录若已经重新采集到，以新值为准，不会回退成旧值。' +
+                        '\n恢复后本次备份即被清除。'
+                    )) return;
+
+                    const result = restoreBackup(backup);
+                    clearBackup();
+                    window.alert(
+                        '已补回 ' + result.added + ' 条记录，当前共 ' + result.total + ' 条。' +
+                        (result.trimmed ? '\n\n超出 ' + CONFIG.maxSessions + ' 条上限，最旧的记录已被截断。' : '')
+                    );
+                    renderDashboard();
                 });
             }
 
@@ -1803,6 +1960,21 @@
                 '<span class="tee-badge">' + PLATFORM.label + ' · v' + VERSION + '</span>' +
                 '<button class="tee-btn tee-reload" style="margin-left: auto !important;">刷新页面</button>' +
                 '</div>';
+        }
+
+        /**
+         * 重置到底会丢什么，按平台的数据来源分别说明。
+         * 三个平台的可恢复范围差得很远：Trae / WorkBuddy 能补拉平台保留的窗口，
+         * QwenWork 的接口返回 404，只能靠此刻页面渲染出来的内容。
+         * 笼统写一句「会重新采集」等于没提示——用户会以为刷新一下就等于原样恢复。
+         */
+        function resetLossNote() {
+            if (PLATFORM.rangeFields) {
+                return '注意：这不等于原样恢复。本地历史里早于平台保留窗口（页面默认请求范围约最近 30 天）的那部分，' +
+                    '重新采集与补拉都取不回来，只能逐日重新积累。';
+            }
+            return '注意：该平台的用量接口不可用，数据只能从当前页面抓取。重置后只能取回此刻页面渲染出的记录，' +
+                '已经翻页 / 滚动走掉的历史会永久丢失。';
         }
 
         // 输入框正被占用时跳过常规重绘，避免打断输入（区间选择本身走强制重绘）
@@ -1995,10 +2167,16 @@
             const extra = stats.unparsedTime > 0
                 ? '<div class="tee-note">有 ' + stats.unparsedTime + ' 条记录时间无法解析，未计入日维度统计</div>'
                 : '';
-            // 本地数据全部可以由页面重建，重置是无损操作——数据异常时的自救入口。
+            // 恢复备份是重置的撤销点，只在确实存在备份时才出现——常驻一个点不动的
+            // 按钮等于让用户每次都在一个无意义的入口上做判断。
             // 诊断信息用脚本自身的 GM 存储读取（数据存在油猴存储里，页面控制台读不到）。
+            const backup = readBackup();
             const tools = '<div class="tee-tools">' +
                 '<button class="tee-tool tee-diag" type="button">复制诊断信息</button>' +
+                (backup
+                    ? '<button class="tee-tool tee-restore" type="button">恢复备份（' +
+                      backup.sessions.length + ' 条 · ' + fmtDateTime(new Date(backup.at)) + '）</button>'
+                    : '') +
                 '<button class="tee-tool tee-reset" type="button">重置本页数据</button>' +
                 '</div>';
             return '<div class="tee-footer"><div class="tee-note">' + escapeHtml(note) + '</div>' + extra +
@@ -2028,6 +2206,10 @@
                     ? ((GM_info.scriptHandler || '?') + ' ' + (GM_info.version || '')).trim()
                     : '(未知)',
                 count: sessions.length,
+                backup: (function () {
+                    const b = readBackup();
+                    return b ? { at: fmtDateTime(new Date(b.at)), count: b.sessions.length } : null;
+                })(),
                 range: { preset: _range.preset, start: _range.start, end: _range.end },
                 rangeHint: _rangeHint.text,
                 // 只导出参数形态与请求头的**名称**：请求头的值里是鉴权凭据，不能带出去
