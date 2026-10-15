@@ -1,0 +1,79 @@
+name: 同步 Release
+
+# 合并到 main 之后，如果脚本里的 @version 还没有对应的 release，就补一个出来，
+# 并把脚本作为资产挂上。此前这一步只靠人记得，v1.13.0 / v1.13.1 就是这样漏发的。
+#
+# 默认建为 draft：说明正文由 CHANGELOG 的对应小节生成，而你手写的发布说明一直比
+# CHANGELOG 更适合直接给用户看（面向用户重写过、去掉了实现细节），所以留一道人工
+# 过目再点发布的关口。想改成建好即发布，把下面的 DRAFT 改成 'false' 即可。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'trae-dashboard-enhancer.user.js'
+      - 'CHANGELOG.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DRAFT: 'true'
+
+# 连续两次推送时排队执行，避免两个 run 同时看到「还没有 release」而各建一个
+concurrency:
+  group: release-sync
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号校验也在这里：@version 与 const VERSION 不一致时脚本会以非 0 退出，
+      # 这一步失败、后面不再执行（宁可这次不发，也不要发一个版本号自相矛盾的 release）
+      - name: 生成发布说明并取出待发布的 tag
+        id: notes
+        run: |
+          set -euo pipefail
+          TAG=$(node .github/scripts/release-notes.mjs --out "$RUNNER_TEMP/notes.md")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "本次对应的版本：$TAG"
+
+      # 查的必须是「所有 release」而不是「所有 tag」：draft 在发布之前并不会建出 tag，
+      # 只查 tag 的话，第一次跑建了 draft、第二次跑仍然认为不存在，会再建一个。
+      - name: 判断该版本是否已有 release（含 draft）
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.notes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 先把列表取到变量里：管道写法下如果 gh 本身调用失败，判断会落到 else 分支
+          # 去建 release，反而可能建出重复的。取不到列表就让这一步直接失败。
+          RELEASES=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name')
+          if grep -qx "$TAG" <<< "$RELEASES"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG 已有 release（含 draft），跳过。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$TAG 还没有 release，准备创建。"
+          fi
+
+      - name: 创建 release 并挂上脚本
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.notes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$DRAFT" = "true" ]; then
+            gh release create "$TAG" trae-dashboard-enhancer.user.js \
+              --title "$TAG" --target "$GITHUB_SHA" --draft --notes-file "$RUNNER_TEMP/notes.md"
+            echo "已创建 draft release $TAG，请在 Releases 页过目后点发布。"
+          else
+            gh release create "$TAG" trae-dashboard-enhancer.user.js \
+              --title "$TAG" --target "$GITHUB_SHA" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "已创建并发布 $TAG。"
+          fi
