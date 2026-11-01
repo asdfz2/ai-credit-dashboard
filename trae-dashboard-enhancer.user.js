@@ -3,8 +3,8 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.13.1
-// @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
+// @version      1.14.0
+// @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、产品/使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
 // @homepage     https://github.com/asdfz2/ai-credit-dashboard
@@ -33,7 +33,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.13.1';
+        const VERSION = '1.14.0';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -92,6 +92,11 @@
             client: (s && Object.prototype.hasOwnProperty.call(s, 'client'))
                 ? String(s.client || '')
                 : undefined,
+            // Buddy One 的产品维度（WorkBuddy / 腾讯文档 / ima / 腾讯网盘…）。
+            // 旧记录没有这个字段，读取时保留 undefined，避免被空值覆盖。
+            product: (s && Object.prototype.hasOwnProperty.call(s, 'product'))
+                ? String(s.product || '')
+                : undefined,
             purpose: String((s && (s.agentPurpose || s.purpose)) || ''),
             // 记录里可用的次级标识，用于把「未分类」聚合条目摊开
             detail: String(pick(s, ['session_name', 'detail']) || '')
@@ -107,6 +112,26 @@
         const isFallbackLabel = (name) => {
             const n = String(name);
             return n === MODEL_PLACEHOLDER || FALLBACK_LABELS.indexOf(n) !== -1 || DASH_MODEL_RE.test(n);
+        };
+
+        // Buddy One 的产品维度：接口返回的 appType 是产品内部标识，展示名以官方文案为准。
+        // 同一个产品在不同版本里出现过多种写法（docs / doc / tencentdocs），统一到一套标签。
+        const PRODUCT_LABELS = {
+            workbuddy: 'WorkBuddy',
+            codebuddy: 'WorkBuddy',
+            docs: '腾讯文档',
+            doc: '腾讯文档',
+            tencentdocs: '腾讯文档',
+            ima: 'ima',
+            drive: '腾讯网盘',
+            netdisk: '腾讯网盘',
+            netdrive: '腾讯网盘',
+            meeting: '腾讯会议'
+        };
+        const productLabel = (key) => {
+            const raw = String(key || '').trim();
+            if (!raw) return '';
+            return PRODUCT_LABELS[raw.toLowerCase()] || raw;
         };
 
         // 这些是脚本自己造的占位名，不是页面上真实存在的标识。
@@ -266,6 +291,25 @@
                 pagePath: '/profile/plans-usage',
                 apiUrl: 'https://www.workbuddy.cn/billing/meter/get-user-request-usage',
 
+                // 2026-10 起页面默认停在「积分概览」，只有切到「消耗明细」才挂载表格并发请求。
+                // 因此不能再等页面自己发请求：首屏主动拉一次，页面请求只作为实时补充。
+                bootstrapOnLoad: true,
+                usageTabText: '消耗明细',
+                reloadLabel: '刷新数据',
+                // 面板增加「各产品积分消耗」一节；旧记录没有 product 字段时单独说明
+                productDimension: true,
+                // 鉴权头不只出现在用量接口上；同域的其它 billing 请求里也有，
+                // 首屏没有用量请求时从这些请求借用（只放内存，不落盘）
+                headerApi: (url) => !!url && url.indexOf('/billing/') !== -1,
+                // 页面可能带着产品筛选（appTypes）发请求；面板口径是账号级，
+                // 主动采集/区间补拉必须把这些筛选剥掉，否则只会拉到某一个产品
+                stripRequestFields: ['appTypes', 'subscribeType'],
+                // 页面默认 10 条/页；脚本自己从第 1 页开始请求，可以安全地抬高每页条数
+                preferredPageSize: 200,
+                // 企业版 v2 用 nextPageToken 翻页，没有 total；只在 WorkBuddy 上启用，
+                // 避免其它平台请求体里恰好带 version: 2 时被误判
+                tokenPagination: true,
+
                 usageApi: (url) => !!url && url.indexOf('/billing/meter/get-user-request-usage') !== -1,
 
                 // 只关心用量明细接口：其它 billing 接口的数据页面自己会展示，不做重复呈现
@@ -274,13 +318,19 @@
                 extract(payload) {
                     const d = payload && payload.data;
                     if (!d || !Array.isArray(d.data)) return null;
-                    return { records: d.data, total: num(d.total) };
+                    return {
+                        records: d.data,
+                        total: num(d.total),
+                        // 企业版 v2 用 nextPageToken 翻页，没有 total
+                        nextPageToken: d.nextPageToken ? String(d.nextPageToken) : ''
+                    };
                 },
 
                 // 只保留统计需要的字段。
                 // 接口同时返回 input / inputTrunc（用户提示词原文），这里刻意丢弃，不落盘。
                 normalize(raw) {
-                    return {
+                    const product = typeof raw.appType === 'string' ? raw.appType.trim() : '';
+                    const session = {
                         session_id: String(raw.requestId || ''),
                         model_name: String(raw.model || ''),
                         usage_time: String(raw.requestTime || ''),
@@ -288,6 +338,10 @@
                         client: String(raw.client || ''),
                         purpose: String(raw.agentPurpose || '')
                     };
+                    // 只有接口真的给出 appType 时才写 product：
+                    // 旧响应没有这个字段，写成空串会在合并时覆盖掉已经采集到的产品名
+                    if (product) session.product = product;
+                    return session;
                 },
 
                 continueBody(body, page) {
@@ -314,9 +368,13 @@
                     endTime: endDay + ' 23:59:59'
                 }),
 
-                // WorkBuddy 与 CodeBuddy 共用同一账号积分池，明细里会同时出现
-                // WorkBuddy / CLI 等使用端，所以面板口径是账号级。
-                note: '统计口径：账号级用量，含 WorkBuddy / CLI 等全部使用端。数据只存在本机浏览器，不含对话内容。'
+                // WorkBuddy 与 CodeBuddy 共用同一账号积分池；Buddy One 之后积分池
+                // 又扩到腾讯文档 / ima / 腾讯网盘，因此面板口径是账号级。
+                // 有产品字段时说明 Buddy One 口径，没有时保留旧文案，避免对未加入的用户说错话。
+                note: (stats) => (stats && ((stats.productBreakdown || []).length > 0))
+                    ? '统计口径：Buddy One 账号级用量，含 WorkBuddy / 腾讯文档 / ima / 腾讯网盘等产品；' +
+                      '腾讯会议不消耗积分。数据只存在本机浏览器，不含对话内容。'
+                    : '统计口径：账号级用量，含 WorkBuddy / CLI 等全部使用端。数据只存在本机浏览器，不含对话内容。'
             }
         };
 
@@ -653,6 +711,12 @@
          * ================================================================== */
 
         let _lastApiRequest = { url: '', method: 'POST', body: {}, headers: {} };
+        // 最近一次同域 billing 请求（不一定是用量接口）。新版页面首屏不请求用量明细，
+        // 主动采集需要从这里借用 X-Client-Platform / X-Enterprise-Id 等请求头。
+        // 只放内存，绝不写入本地存储。
+        let _lastBillingRequest = { url: '', headers: {}, at: 0 };
+        // 页面自己最近一次发出用量请求的时间：主动采集前用它判断是否还需要重复请求
+        let _lastUsageCaptureAt = 0;
         let _rawFetch = null;
 
         // 翻页占位放在内存里，不写入本地存储。
@@ -663,24 +727,65 @@
             (p.success === true || p.code === undefined || p.code === 0 || p.code === 200);
 
         function sanitizeHeaders(headers) {
-            const out = Object.assign({}, headers || {});
-            ['content-length', 'host', 'connection', 'accept-encoding'].forEach((k) => {
-                delete out[k];
-                delete out[k.toUpperCase()];
+            const blocked = new Set([
+                'content-length', 'host', 'connection', 'accept-encoding', 'cookie', 'set-cookie'
+            ]);
+            const out = {};
+            Object.keys(headers || {}).forEach((key) => {
+                if (blocked.has(String(key).toLowerCase())) return;
+                out[key] = headers[key];
             });
             return out;
         }
 
-        function computePagination(total, requestBody, records) {
+        /**
+         * 脚本自己发用量请求时用的请求头。
+         * 优先复用量接口自己发过的那一份；首屏没有用量请求时，退到最近一次 billing 请求
+         * （页面加载时会请求余额/资源等接口，X-Client-Platform 就在里面）。
+         * 鉴权仍靠 credentials: 'include' 的 Cookie，这里只补齐平台标识类请求头。
+         */
+        function usageRequestHeaders() {
+            const primary = (_lastApiRequest.headers && Object.keys(_lastApiRequest.headers).length)
+                ? _lastApiRequest.headers
+                : (_lastBillingRequest.headers || {});
+            const sanitized = sanitizeHeaders(primary);
+            // 统一小写，避免页面给的 content-type 与这里补的 Content-Type 同时出现
+            const headers = {};
+            Object.keys(sanitized).forEach((key) => {
+                headers[String(key).toLowerCase()] = sanitized[key];
+            });
+            if (!headers['content-type']) headers['content-type'] = 'application/json';
+            // 只有声明了 headerApi 的平台（WorkBuddy）才补这个平台标识；
+            // Trae 是跨域接口，平白多一个自定义头会触发额外的 CORS 预检
+            if (PLATFORM.headerApi && !headers['x-client-platform']) {
+                headers['x-client-platform'] = 'web';
+            }
+            return headers;
+        }
+
+        function computePagination(total, requestBody, records, nextPageToken) {
             const b = requestBody || {};
             const currentPage = num(pick(b, ['pageNum', 'page_num', 'PageNumber', 'page', 'CurrentPage'])) || 1;
             const pageSize = num(pick(b, ['pageSize', 'page_size', 'PageSize', 'limit'])) || records.length || 20;
+            // 企业版 v2 没有 total，用 nextPageToken 串下一页；不能再用 pageNum 自增，
+            // 否则第二页开始就会请求同一份数据（服务端忽略 pageNum）
+            if (PLATFORM.tokenPagination && (nextPageToken || num(b.version) === 2)) {
+                return {
+                    mode: 'token',
+                    currentPage: 1,
+                    pageSize,
+                    total: 0,
+                    totalPages: 0,
+                    discovery: true,
+                    nextPageToken: nextPageToken || ''
+                };
+            }
             const t = num(total);
             // 接口没给总条数时转为「自发现翻页」，靠「某页无新增」来终止
             const totalPages = t > 0
                 ? Math.max(1, Math.ceil(t / Math.max(pageSize, 1)))
                 : currentPage + CONFIG.maxAutoPages;
-            return { currentPage, pageSize, total: t, totalPages, discovery: t <= 0 };
+            return { mode: 'page', currentPage, pageSize, total: t, totalPages, discovery: t <= 0 };
         }
 
         /**
@@ -764,8 +869,10 @@
             }
 
             if (!opts.skipPagination && parsed && parsed.records.length > 0) {
-                const info = computePagination(parsed.total, requestBody, parsed.records);
-                if (info.totalPages > info.currentPage) {
+                const info = computePagination(parsed.total, requestBody, parsed.records, parsed.nextPageToken);
+                if (info.mode === 'token') {
+                    if (info.nextPageToken) fetchAllPages(url, requestBody, info);
+                } else if (info.totalPages > info.currentPage) {
                     fetchAllPages(url, requestBody, info);
                 }
             }
@@ -774,7 +881,8 @@
         }
 
         async function fetchAllPages(baseUrl, requestBody, info) {
-            const sig = JSON.stringify(requestBody || {});
+            const tokenMode = info.mode === 'token';
+            const sig = (tokenMode ? 'token:' : 'page:') + JSON.stringify(requestBody || {});
             if (_pagingInFlight.has(sig)) {
                 log('该时间范围已在翻页中，跳过');
                 return;
@@ -782,21 +890,32 @@
             _pagingInFlight.add(sig);
             const doFetch = _rawFetch || window.fetch.bind(window);
             const lastPage = Math.min(info.totalPages, info.currentPage + CONFIG.maxAutoPages);
-            log('开始自动翻页: 当前 ' + info.currentPage + '/' + lastPage + (info.discovery ? '（自发现模式）' : ''));
+            let token = info.nextPageToken || '';
+            const seenTokens = new Set();
+            log('开始自动翻页: ' + (tokenMode ? 'pageToken 模式' : '当前 ' + info.currentPage + '/' + lastPage) +
+                (info.discovery && !tokenMode ? '（自发现模式）' : ''));
 
             try {
-                for (let page = info.currentPage + 1; page <= lastPage; page++) {
-                    const body = PLATFORM.continueBody(requestBody, page);
-                    const headers = Object.assign(
-                        { 'Content-Type': 'application/json' },
-                        sanitizeHeaders(_lastApiRequest.headers)
-                    );
+                for (let step = 0; step < CONFIG.maxAutoPages; step++) {
+                    let body;
+                    if (tokenMode) {
+                        if (!token || seenTokens.has(token)) break;
+                        seenTokens.add(token);
+                        // v2 只认 pageToken；pageNum 会被忽略或报错，必须去掉
+                        body = Object.assign({}, requestBody, { pageToken: token });
+                        delete body.pageNum;
+                        if (num(body.version) !== 2) body.version = 2;
+                    } else {
+                        const page = info.currentPage + 1 + step;
+                        if (page > lastPage) break;
+                        body = PLATFORM.continueBody(requestBody, page);
+                    }
                     let payload;
                     try {
                         const resp = await doFetch(baseUrl, {
                             method: 'POST',
                             credentials: 'include',
-                            headers,
+                            headers: usageRequestHeaders(),
                             body: JSON.stringify(body)
                         });
                         if (!resp.ok) {
@@ -809,10 +928,15 @@
                         break;
                     }
                     const r = mergePayload(baseUrl, payload, body, { skipPagination: true });
-                    log('已取第 ' + page + ' 页，新增 ' + (r ? r.added : 0) + ' 条');
+                    log('已取' + (tokenMode ? '下一页' : '第 ' + (info.currentPage + 1 + step) + ' 页') +
+                        '，新增 ' + (r ? r.added : 0) + ' 条');
                     if (!r || r.added === 0) {
-                        log('第 ' + page + ' 页无新增，停止翻页');
+                        log('本页无新增，停止翻页');
                         break;
+                    }
+                    if (tokenMode) {
+                        token = (r.parsed && r.parsed.nextPageToken) || '';
+                        if (!token) break;
                     }
                     await sleep(CONFIG.pageDelayMs);
                 }
@@ -874,13 +998,20 @@
                 _rawFetch = originalFetch.bind(window);
                 window.fetch = function (input, init) {
                     const url = typeof input === 'string' ? input : ((input && input.url) || '');
+                    const headers = normalizeHeaders((init && init.headers) || (input && input.headers));
                     const reqInfo = {
                         url,
                         method: (init && init.method) || 'GET',
                         body: PLATFORM.usageApi(url) ? parseRequestBody(init && init.body) : {},
-                        headers: normalizeHeaders(init && init.headers)
+                        headers
                     };
-                    if (PLATFORM.usageApi(url)) _lastApiRequest = reqInfo;
+                    if (PLATFORM.headerApi && PLATFORM.headerApi(url)) {
+                        _lastBillingRequest = { url, headers, at: Date.now() };
+                    }
+                    if (PLATFORM.usageApi(url)) {
+                        _lastApiRequest = reqInfo;
+                        _lastUsageCaptureAt = Date.now();
+                    }
 
                     const result = originalFetch.apply(this, arguments);
                     if (PLATFORM.watchApi(url)) {
@@ -902,7 +1033,7 @@
             };
 
             XMLHttpRequest.prototype.setRequestHeader = function (key, value) {
-                if (this._teeUrl && PLATFORM.usageApi(this._teeUrl) && this._teeHeaders) {
+                if (this._teeUrl && PLATFORM.headerApi && PLATFORM.headerApi(this._teeUrl) && this._teeHeaders) {
                     this._teeHeaders[String(key).toLowerCase()] = value;
                 }
                 return originalSetRequestHeader.apply(this, arguments);
@@ -910,6 +1041,9 @@
 
             XMLHttpRequest.prototype.send = function (body) {
                 const url = this._teeUrl;
+                if (url && PLATFORM.headerApi && PLATFORM.headerApi(url)) {
+                    _lastBillingRequest = { url, headers: this._teeHeaders || {}, at: Date.now() };
+                }
                 if (url && PLATFORM.watchApi(url)) {
                     const reqInfo = {
                         url,
@@ -917,7 +1051,10 @@
                         body: PLATFORM.usageApi(url) ? parseRequestBody(body) : {},
                         headers: this._teeHeaders || {}
                     };
-                    if (PLATFORM.usageApi(url)) _lastApiRequest = reqInfo;
+                    if (PLATFORM.usageApi(url)) {
+                        _lastApiRequest = reqInfo;
+                        _lastUsageCaptureAt = Date.now();
+                    }
                     this.addEventListener('load', function () {
                         if (this.responseType && this.responseType !== 'text' && this.responseType !== 'json') return;
                         const payload = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
@@ -946,10 +1083,7 @@
         // （HTTP 状态、接口业务码、异常名），不带响应体——响应体里可能有用户输入。
         async function postUsageRequest(url, body) {
             const doFetch = _rawFetch || window.fetch.bind(window);
-            const headers = Object.assign(
-                { 'Content-Type': 'application/json' },
-                sanitizeHeaders(_lastApiRequest.headers)
-            );
+            const headers = usageRequestHeaders();
             try {
                 const resp = await doFetch(url, {
                     method: 'POST',
@@ -987,7 +1121,50 @@
             }
         }
 
-        async function bootstrapPlatform() {
+        /**
+         * 构造脚本自己发出的请求体：以页面请求为模板，从第 1 页开始。
+         * - WorkBuddy 的页面可能带产品筛选，主动采集要剥掉，保证账号级口径
+         * - 从第 1 页开始请求时改 pageSize 不会造成偏移，可以抬到平台偏好值
+         * - 企业版 v2 只认 pageToken，必须清掉 pageNum
+         */
+        function prepareUsageBody(base, injected) {
+            const merged = Object.assign({}, base || {}, injected || {});
+            const body = PLATFORM.continueBody(merged, 1);
+            (PLATFORM.stripRequestFields || []).forEach((key) => { delete body[key]; });
+            if (PLATFORM.preferredPageSize) body.pageSize = PLATFORM.preferredPageSize;
+            if (PLATFORM.tokenPagination && num(body.version) === 2) {
+                body.pageToken = '';
+                delete body.pageNum;
+            }
+            return body;
+        }
+
+        // 新版 WorkBuddy 把用量表收进了「消耗明细」tab。直连接口失败时，
+        // 点一下这个 tab 让页面自己发请求，作为兜底（只点一次，避免反复触发埋点）
+        let _usageTabClicked = false;
+        // 主动采集进行中：重试循环不要同时去点 tab，避免两路请求互相干扰
+        let _bootstrapInFlight = false;
+        function openUsageTab() {
+            if (!PLATFORM.usageTabText || _usageTabClicked) return false;
+            const candidates = document.querySelectorAll('[role="tablist"] button, button');
+            for (let i = 0; i < candidates.length; i++) {
+                const btn = candidates[i];
+                if ((btn.textContent || '').trim() !== PLATFORM.usageTabText) continue;
+                try {
+                    btn.click();
+                    _usageTabClicked = true;
+                    log('已切换到「' + PLATFORM.usageTabText + '」');
+                    return true;
+                } catch (e) {
+                    warn('切换「' + PLATFORM.usageTabText + '」失败:', e);
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        async function bootstrapPlatformInner(opts) {
+            const force = !!(opts && opts.force);
             if (PLATFORM.postFetch) {
                 try {
                     await PLATFORM.postFetch();
@@ -995,26 +1172,49 @@
                     warn('页面数据提取失败:', e);
                 }
                 renderDashboard();
-                return;
+                return { ok: true, added: 0 };
             }
-            if (!PLATFORM.apiUrl || !PLATFORM.defaultBody) return;
-            if (DataStore.count() > 0) {
+            if (!PLATFORM.apiUrl || !PLATFORM.defaultBody) return { ok: false, reason: '平台未声明接口' };
+            if (!force && DataStore.count() > 0) {
                 log('已有本地数据，跳过主动采集');
-                return;
+                return { ok: true, skipped: true };
             }
 
             // 优先复用页面自己发过的请求（参数与鉴权头都是现成的），否则用平台默认参数
-            const captured = _lastApiRequest.url ? _lastApiRequest : null;
+            const captured = (_lastApiRequest.url && _lastApiRequest.body &&
+                Object.keys(_lastApiRequest.body).length) ? _lastApiRequest : null;
             const url = captured ? captured.url : PLATFORM.apiUrl;
-            const body = captured ? captured.body : PLATFORM.defaultBody();
+            const base = captured ? captured.body : PLATFORM.defaultBody();
+            const body = prepareUsageBody(base);
             if (!body || Object.keys(body).length === 0) {
                 log('拿不到可用的请求参数，跳过主动采集');
-                return;
+                return { ok: false, reason: '拿不到可用的请求参数' };
             }
 
             log('主动采集:', url, body);
-            await postUsageRequest(url, body);
+            const res = await postUsageRequest(url, body);
+            // 先渲染第一页，再等分页跑完；否则大区间要等几十页才看得到数字
             renderDashboard();
+            if (res.ok && PLATFORM.bootstrapOnLoad) {
+                // 让自动翻页跑完再交回渲染，避免用户看到第一页就先下结论
+                await waitForPaging(30000);
+            }
+            if (!res.ok && PLATFORM.usageTabText && openUsageTab()) {
+                log('主动采集失败，已切到「' + PLATFORM.usageTabText + '」触发页面请求');
+                await sleep(1500);
+            }
+            renderDashboard();
+            return res;
+        }
+
+        async function bootstrapPlatform(opts) {
+            if (_bootstrapInFlight) return { ok: false, reason: '正在采集' };
+            _bootstrapInFlight = true;
+            try {
+                return await bootstrapPlatformInner(opts);
+            } finally {
+                _bootstrapInFlight = false;
+            }
         }
 
         /**
@@ -1064,11 +1264,10 @@
                 : PLATFORM.defaultBody();
 
             // 只替换起止与分页起点，其余参数沿用页面请求体（如 Trae 的 usage_type）。
-            // 每页条数刻意不改：改它会同时改变偏移量，中间的数据会被跳过
+            // WorkBuddy 的产品筛选（appTypes）在这里会被 prepareUsageBody 剥掉：
+            // 面板是账号级口径，不能因为页面选了某个产品就把补拉限制在该产品内。
             const injected = PLATFORM.rangeFields(startDay, endDay);
-            const body = PLATFORM.continueBody(
-                Object.assign({}, base, matchRequestShape(base, injected)), 1
-            );
+            const body = prepareUsageBody(base, matchRequestShape(base, injected));
             const url = _lastApiRequest.url || PLATFORM.apiUrl;
 
             // 记下这次真正发出去的参数形态，供「复制诊断信息」排查字段格式问题
@@ -1613,10 +1812,15 @@
 
             let totalCents = 0;
             const modelMap = new Map();
+            const productMap = new Map();
             const clientMap = new Map();
             const dailyMap = new Map();
             // 未分类聚合条目的下级明细：仅模型桶需要（模型桶本身就是模型维度，只能按详情细分）
             const modelChildMap = new Map();
+            let unlabeledProductCents = 0;
+            let unlabeledProductCalls = 0;
+            let unlabeledProductStart = '';
+            let unlabeledProductEnd = '';
             let unparsedTime = 0;
 
             const bumpChild = (outer, outerKey, innerKey, cents) => {
@@ -1644,6 +1848,7 @@
                 // 「总数与各柱之和」「今日与趋势末柱」对不上（见 v1.5.2）
                 const cents = Math.round(s.credit * 100);
                 totalCents += cents;
+                const ts = parseTime(s.time);
 
                 // 原样展示采集到的模型标识：'-' 就是页面给出的「未公布」，不改写成别的说法
                 const model = s.model || MODEL_PLACEHOLDER;
@@ -1676,7 +1881,26 @@
                     // 「各模型积分消耗」中各自成行，再叠一层折叠属于重复呈现。
                 }
 
-                const ts = parseTime(s.time);
+                // Buddy One 产品维度。只有声明了 productDimension 的平台才统计；
+                // 旧记录没有 product 字段，单独累计成「未标注产品」，不伪造归属。
+                if (PLATFORM.productDimension) {
+                    if (s.product) {
+                        const label = productLabel(s.product);
+                        const p = productMap.get(label) || { credits: 0, calls: 0 };
+                        p.credits += cents;
+                        p.calls += 1;
+                        productMap.set(label, p);
+                    } else {
+                        unlabeledProductCents += cents;
+                        unlabeledProductCalls += 1;
+                        if (ts > 0) {
+                            const day = fmtDate(new Date(ts));
+                            if (!unlabeledProductStart || day < unlabeledProductStart) unlabeledProductStart = day;
+                            if (!unlabeledProductEnd || day > unlabeledProductEnd) unlabeledProductEnd = day;
+                        }
+                    }
+                }
+
                 if (ts > 0) {
                     const dateStr = fmtDate(new Date(ts));
                     const d = dailyMap.get(dateStr) || { cents: 0, calls: 0 };
@@ -1717,6 +1941,20 @@
                 ? {
                     credits: omittedClientRows.reduce((a, r) => a + Math.round(r.credits * 100), 0) / 100,
                     calls: omittedClientRows.reduce((a, r) => a + r.calls, 0)
+                }
+                : null;
+
+            // 产品维度与使用端不同：空值不是「未知产品」这种占位桶，而是
+            // 旧版本没有采集 appType 的历史记录。单独累计，不参与产品排行。
+            const productBreakdown = productMap.size > 0 ? toRows(productMap) : [];
+            // 只有至少一条记录带产品字段时才展示产品一节；否则说明这是
+            // 尚未升级到 Buddy One 的旧数据，不拿「未标注产品」去打扰用户
+            const unlabeledProduct = (productMap.size > 0 && unlabeledProductCalls > 0)
+                ? {
+                    credits: unlabeledProductCents / 100,
+                    calls: unlabeledProductCalls,
+                    start: unlabeledProductStart || null,
+                    end: unlabeledProductEnd || null
                 }
                 : null;
 
@@ -1789,6 +2027,8 @@
                 monthCredits: monthCents / 100,
                 entitlementCredits,
                 modelBreakdown,
+                productBreakdown,
+                unlabeledProduct,
                 clientBreakdown,
                 unlabeledClient,
                 dailyTrend,
@@ -1838,6 +2078,20 @@
             const trendBody = renderTrendChart(stats.dailyTrend) +
                 (stats.trendNote ? '<div class="tee-note tee-note-spaced">' + escapeHtml(stats.trendNote) + '</div>' : '');
 
+            // 产品一节：Buddy One 账号的积分池跨产品共享，先按产品拆一层；
+            // 旧记录没有 appType，单独说明差额，不硬塞进某个产品。
+            let productBody = stats.productBreakdown.length > 0
+                ? renderBreakdown(stats.productBreakdown, '请求')
+                : '';
+            if (stats.unlabeledProduct) {
+                const up = stats.unlabeledProduct;
+                const dateRange = (up.start && up.end) ? '，' + up.start + ' ~ ' + up.end : '';
+                productBody += '<div class="tee-note tee-note-spaced">' + escapeHtml(
+                    '另有 ' + formatNumber(up.credits) + ' 积分（' + up.calls + ' 请求' + dateRange +
+                    '）未标注产品，已计入上方的模型统计；这些是旧版本采集、且不在本次补拉窗口内的历史记录（没有 appType 字段）'
+                ) + '</div>';
+            }
+
             // 使用端一节：把「未标注使用端」的记录摘出去之后，需要说明剩下的差额去哪了，
             // 否则这一节会静默地加不出总数
             let clientBody = stats.clientBreakdown.length > 0
@@ -1854,11 +2108,14 @@
                 // 模型桶的未分类条目（模型名为 `-` 或缺失）按记录详情细分。
                 // 使用端桶不做细分，也不保留占位桶：模型已在上一节各自成行。
                 section('各模型积分消耗', renderBreakdown(stats.modelBreakdown, '调用', '详情')),
+                productBody ? section('各产品积分消耗', productBody) : '',
                 clientBody ? section('各使用端积分消耗', clientBody) : '',
                 section(trendTitle, trendBody)
             ].join('');
 
-            const note = PLATFORM.note || ('统计口径：本地已采集的 ' + PLATFORM.label + ' 用量记录。数据只存在本机浏览器。');
+            const note = typeof PLATFORM.note === 'function'
+                ? PLATFORM.note(stats)
+                : (PLATFORM.note || ('统计口径：本地已采集的 ' + PLATFORM.label + ' 用量记录。数据只存在本机浏览器。'));
 
             container.innerHTML = header() +
                 rangeControl(rangeStatusLines(stats, filtered, allSessions)) +
@@ -1868,7 +2125,21 @@
 
             const reloadBtn = container.querySelector('.tee-reload');
             if (reloadBtn) {
-                reloadBtn.addEventListener('click', () => window.location.reload());
+                reloadBtn.addEventListener('click', async () => {
+                    // Trae / QwenWork 仍靠刷新页面重新触发页面请求；
+                    // WorkBuddy 新版页面刷新后停在「积分概览」，reload 不会发用量请求，
+                    // 因此这里直接向接口取一次数，按钮文案也改为「刷新数据」。
+                    if (!PLATFORM.bootstrapOnLoad) {
+                        window.location.reload();
+                        return;
+                    }
+                    if (reloadBtn.disabled || _bootstrapInFlight) return;
+                    reloadBtn.disabled = true;
+                    reloadBtn.textContent = '刷新中…';
+                    const res = await bootstrapPlatform({ force: true });
+                    if (!res || (!res.ok && res.reason !== '正在采集')) openUsageTab();
+                    renderDashboard(true);
+                });
             }
 
             const resetBtn = container.querySelector('.tee-reset');
@@ -1958,7 +2229,8 @@
                 '<div class="tee-header">' +
                 '<h3>用量增强面板</h3>' +
                 '<span class="tee-badge">' + PLATFORM.label + ' · v' + VERSION + '</span>' +
-                '<button class="tee-btn tee-reload" style="margin-left: auto !important;">刷新页面</button>' +
+                '<button class="tee-btn tee-reload" style="margin-left: auto !important;">' +
+                (PLATFORM.reloadLabel || '刷新页面') + '</button>' +
                 '</div>';
         }
 
@@ -1970,7 +2242,7 @@
          */
         function resetLossNote() {
             if (PLATFORM.rangeFields) {
-                return '注意：这不等于原样恢复。本地历史里早于平台保留窗口（页面默认请求范围约最近 30 天）的那部分，' +
+                return '注意：这不等于原样恢复。本地历史里早于平台保留窗口（页面默认请求范围约最近 7~30 天）的那部分，' +
                     '重新采集与补拉都取不回来，只能逐日重新积累。';
             }
             return '注意：该平台的用量接口不可用，数据只能从当前页面抓取。重置后只能取回此刻页面渲染出的记录，' +
@@ -3022,6 +3294,27 @@
                 return;
             }
 
+            // WorkBuddy 新版页面默认停在「积分概览」，不会自己请求用量明细；
+            // 本地有缓存时下面的 check 会直接返回，所以首屏要单独安排一次主动采集。
+            // 页面若已经自己发过用量请求（例如用户手点了消耗明细）且没有产品筛选，
+            // 就不再重复；带 appTypes 的请求只覆盖一个产品，仍需补一次账号级数据。
+            if (PLATFORM.bootstrapOnLoad) {
+                setTimeout(async () => {
+                    if (!isOnUsagePage()) return;
+                    const capturedBody = _lastApiRequest.body || {};
+                    const capturedFiltered =
+                        (Array.isArray(capturedBody.appTypes) && capturedBody.appTypes.length > 0) ||
+                        (Array.isArray(capturedBody.subscribeType) && capturedBody.subscribeType.length > 0);
+                    if (_lastUsageCaptureAt && Date.now() - _lastUsageCaptureAt < 5000 && !capturedFiltered) {
+                        log('页面已自行请求用量接口，跳过首屏主动采集');
+                        renderDashboard();
+                        return;
+                    }
+                    await bootstrapPlatform({ force: true });
+                    renderDashboard(true);
+                }, 2500);
+            }
+
             let retries = 0;
             const check = () => {
                 if (DataStore.count() > 0) {
@@ -3030,11 +3323,23 @@
                 }
                 retries++;
                 if (retries === 3) {
-                    log('尝试点击时间范围按钮触发请求…');
-                    triggerTimeRangeButtons();
+                    if (PLATFORM.usageTabText) {
+                        if (!_bootstrapInFlight) {
+                            log('尝试打开「' + PLATFORM.usageTabText + '」触发请求…');
+                            openUsageTab();
+                        }
+                    } else {
+                        log('尝试点击时间范围按钮触发请求…');
+                        triggerTimeRangeButtons();
+                    }
                 }
                 if (retries === 5) {
-                    bootstrapPlatform();
+                    if (!PLATFORM.bootstrapOnLoad) {
+                        bootstrapPlatform();
+                    } else if (!_bootstrapInFlight && DataStore.count() === 0) {
+                        // 首屏那次主动采集可能因为请求头/网络原因失败，再给一次机会
+                        bootstrapPlatform({ force: true });
+                    }
                 }
                 if (retries >= limit) {
                     renderDashboard(true);

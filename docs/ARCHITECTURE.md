@@ -12,7 +12,7 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 |------|-----------|------------|---------|
 | Trae | `www.trae.cn/dashboard*` / `trae.cn/dashboard*` | API 拦截 + 自动翻页 | 深色（`#1a1a2e`） |
 | QwenWork | `qwenwork.cn/app/settings/usage*` / `www.qwenwork.cn/app/settings/usage*` | DOM 文本提取 | 浅色（白色） |
-| WorkBuddy | `www.workbuddy.cn/profile/plans-usage*` / `workbuddy.cn/profile/plans-usage*` | API 拦截 + 自动翻页 | 浅色（`#F5F7FA` 底 + `#00C29A` 强调） |
+| WorkBuddy | `www.workbuddy.cn/profile/plans-usage*` / `workbuddy.cn/profile/plans-usage*` | API 拦截 + 首屏主动取数 + 自动翻页 | 浅色（`#F5F7FA` 底 + `#00C29A` 强调） |
 
 脚本按 `window.location.hostname` 与 `pathname` 自动识别平台。识别失败时脚本直接退出，不做任何注入。
 
@@ -44,8 +44,8 @@ Tampermonkey 用户脚本，单文件、原生 JavaScript、无运行时依赖�
 
 1. `init()` 安装 `fetch` / `XMLHttpRequest` 拦截器，等待页面加载后渲染面板，并启动 DOM 监听。
 2. 命中 `watchApi` 的响应交给 `mergePayload()`：解析 → 归一化 → 按记录 ID 去重合并 → 落盘。
-3. `computePagination()` 由请求体中的分页参数（`pageNum` / `page_num` / `page`）与接口给出的总条数推导总页数；总页数大于当前页时，`fetchAllPages()` 自动拉取剩余分页，每页间隔 300ms。
-4. `computeStats()` 基于会话数据计算总消耗、今日、近 7 天、本月、模型分布、使用端分布与每日趋势；选中区间时改为区间的同一组指标。
+3. `computePagination()` 由请求体中的分页参数（`pageNum` / `page_num` / `page`）与接口给出的总条数推导总页数；总页数大于当前页时，`fetchAllPages()` 自动拉取剩余分页，每页间隔 300ms。企业版 v2 没有 `total`，改由 `nextPageToken` 串页，`fetchAllPages()` 在 token 模式下逐页跟随。
+4. `computeStats()` 基于会话数据计算总消耗、今日、近 7 天、本月、模型分布、产品分布、使用端分布与每日趋势；选中区间时改为区间的同一组指标。
 5. `renderDashboard()` 按数据指纹判断是否需要重绘，把统计结果渲染为卡片、条形图和柱状图。指纹里带上区间签名与记录条数，因此「切到一个同样没有数据的区间」也会重绘。
 
 ### Trae 路径
@@ -70,14 +70,16 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 
 ### WorkBuddy 路径
 
-1. 拦截 `POST /billing/meter/get-user-request-usage`，请求体形如 `{startTime, endTime, pageNum, pageSize}`。
-2. `normalize()` 只保留 `requestId / credit / model / requestTime / client / agentPurpose`，**刻意丢弃 `input` 与 `inputTrunc`**（对话提示词原文）。
-3. 首次进入页面时 `bootstrapPlatform()` 主动请求最近 30 天、`pageSize=200` 的数据；页面自身发起的请求（默认 7 天）也会被合并，因此面板覆盖的是两者的并集。
-4. 自动翻页沿用原请求的 `pageSize`——改 `pageSize` 会同时改变偏移量，导致中间数据被跳过。
+1. 拦截 `POST /billing/meter/get-user-request-usage`，个人版请求体形如 `{startTime, endTime, pageNum, pageSize}`，企业版 v2 形如 `{startTime, endTime, pageSize, version: 2, pageToken}`。
+2. `normalize()` 只保留 `requestId / credit / model / requestTime / client / appType / agentPurpose`，**刻意丢弃 `input` 与 `inputTrunc`**（对话提示词原文）。`appType` 落成 `product`，用于 Buddy One 的产品维度。
+3. 2026-10-30 起页面把「套餐与用量」拆成「积分概览 / 消耗明细」两个 tab，默认停在概览；用量表只在「消耗明细」挂载时才请求。因此 `bootstrapPlatform()` 在首屏主动请求一次最近 30 天、`pageSize=200` 的数据，**不再因为本地有缓存而跳过**；页面自身发起的请求（默认 7 天）也会被合并。页面若已经自行发过用量请求且没有产品筛选，则跳过这次主动采集。
+4. 直连接口失败时兜底点一下「消耗明细」，让页面自己发请求；只点一次，避免反复触发埋点。
+5. 主动采集与区间补拉都会剥掉页面请求体里的 `appTypes` / `subscribeType`，保证面板始终是账号级口径；从第 1 页开始时把 `pageSize` 抬到 200。自动翻页沿用本次请求的 `pageSize`——续接页面自己的分页时不能改，否则中间数据会被跳过。
+6. 企业版 v2 没有 `total`，用 `nextPageToken` 串页；`pageNum` 必须清掉，否则会重复请求同一页。
 
 ## 日期范围筛选
 
-面板顶部有一行区间控件：预设芯片（近 7 天 / 近 30 天 / 本月 / 全部）+ 两个原生 `date` 输入 + 「应用」。选中区间后**所有指标一起换口径**——卡片、模型分布、使用端分布、趋势图都只统计区间内的记录。
+面板顶部有一行区间控件：预设芯片（近 7 天 / 近 30 天 / 本月 / 全部）+ 两个原生 `date` 输入 + 「应用」。选中区间后**所有指标一起换口径**——卡片、模型分布、产品与使用端分布、趋势图都只统计区间内的记录。
 
 状态与筛选：
 
@@ -147,12 +149,13 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 - `time`：时间，依次尝试 `usage_time` / `created_at` / `requestTime` / `time`，兼容毫秒、秒与字符串。
 - `model`：模型维度聚合键，依次尝试 `model_name` / `model` / `source`。
 - `client`：使用端。**只有记录本身带该字段时才参与「使用端分布」统计**，否则 Trae 的记录会被归入一个多余的「未知使用端」桶。
+- `product`：Buddy One 产品维度，来自接口的 `appType`。只有 WorkBuddy 声明了 `productDimension`；旧记录没有该字段时单独累计为「未标注产品」，不伪造归属。
 
 各平台的落盘字段：
 
 - Trae：原样保留接口返回的会话对象（`credits_float`、`usage_time`、`model_name`、`session_id`、`usage_group_details` 等），仅剔除 `user_input_preview`（用户输入预览，面板从不展示）。
 - QwenWork：`{session_id, model_name, session_name, usage_time, credits_float}`，`session_id` 是「时间 + 来源 + 详情 + 金额」的内容 ID（v1.10.2 起不再带出现序号），确定性生成，跨刷新可稳定去重。
-- WorkBuddy：`{session_id, model_name, usage_time, credits_float, client, purpose}`，不含任何对话内容。
+- WorkBuddy：`{session_id, model_name, usage_time, credits_float, client, product, purpose}`，不含任何对话内容。`product` 来自 `appType`，旧响应没有该字段时不写，合并时保留已有值。
 
 区间筛选状态另存一个键 `<storageKey>_range`，值形如 `{"preset":"7d","start":"2026-10-03","end":"2026-10-09"}`，与用量数据分家（见「日期范围筛选」）。
 
@@ -220,7 +223,7 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 
 面板页脚提供三个自救入口：
 
-- **重置本页数据**：清空当前平台的 `usage_sessions` 并刷新页面，采集流程会重新走一遍。**这不是无损操作**：本地历史是脚本在过去一次次请求中逐次积累下来的，而重新采集（以及区间补拉）只能取回平台仍然保留的那部分——Trae / WorkBuddy 的页面默认请求范围约最近 30 天，早于该窗口的记录取不回来，只能逐日重新积累；QwenWork 的用量接口返回 404，连补拉都没有，重置后只能取回此刻页面渲染出的记录。因此重置前会先把当前记录整份备份到 `<平台存储键>_backup`，作为这一次重置的撤销点；确认弹窗按平台分别说明会丢什么，而不是笼统写一句「会重新采集」。备份只保留最近一次，写入失败即中止重置——没有撤销点的清空不能放行。
+- **重置本页数据**：清空当前平台的 `usage_sessions` 并刷新页面，采集流程会重新走一遍。**这不是无损操作**：本地历史是脚本在过去一次次请求中逐次积累下来的，而重新采集（以及区间补拉）只能取回平台仍然保留的那部分——Trae / WorkBuddy 的页面默认请求范围约最近 7~30 天，早于该窗口的记录取不回来，只能逐日重新积累；QwenWork 的用量接口返回 404，连补拉都没有，重置后只能取回此刻页面渲染出的记录。因此重置前会先把当前记录整份备份到 `<平台存储键>_backup`，作为这一次重置的撤销点；确认弹窗按平台分别说明会丢什么，而不是笼统写一句「会重新采集」。备份只保留最近一次，写入失败即中止重置——没有撤销点的清空不能放行。
   - **确认弹窗如实告知损失范围**（`resetLossNote()`）：按数据来源分两种说法。有 `rangeFields` 的平台（Trae / WorkBuddy）说明「不等于原样恢复，早于平台保留窗口的部分取不回来」；QwenWork 说明「只能取回此刻页面渲染出的记录，已经翻页 / 滚动走掉的历史会永久丢失」。原先那句「重新采集一遍」读起来像是刷新一下就等于原样恢复，实际上是最容易让人误判的一种表述。
   - **恢复备份的合并规则是不覆盖**（`restoreBackup()`）：备份是重置那一刻的旧值，重置后重新采集到的同一会话可能已经是更新的一次消耗，回退成旧值等于用旧数据污染新数据。因此按记录 ID 去重，只补回当前没有的，已有的保留新值。
   - **合并后先按时间排序再套上限**：备份记录接在数组尾部，而分页会把更早的记录接在后面，追加顺序不等于时间顺序。不排序就 `slice(-maxSessions)` 的话，截断丢掉的可能正是刚补回来的新记录。截断真的发生时在结果提示里写明。
@@ -273,8 +276,10 @@ QwenWork 的用量接口返回 404，没有可拦截的数据源，走 `postFetc
 - WorkBuddy 依赖 `/billing/meter/get-user-request-usage` 的字段结构；该接口返回的 `input` 字段属于内部实现细节，若官方移除不影响脚本。
 - 对全局 `fetch` 和 `XMLHttpRequest` 做了 monkey-patch，若目标页面升级后依赖原始函数身份，可能需要调整。
 - QwenWork 的 DOM 提取依赖页面文本结构，若 QwenWork 调整用量页面布局，提取逻辑需要同步更新。
-- WorkBuddy 首次进入只主动拉最近 30 天，更早的历史要靠区间控件选一段区间触发补拉；能补到多早取决于服务端对历史区间的保留策略，接口对早区间返回空时面板只会如实显示 0。
+- WorkBuddy 首次进入主动拉最近 30 天，更早的历史要靠区间控件选一段区间触发补拉；能补到多早取决于服务端对历史区间的保留策略，接口对早区间返回空时面板只会如实显示 0。新版页面默认停在「积分概览」，脚本会主动请求一次；直连接口失败时兜底切到「消耗明细」让页面自己发请求。
+- Buddy One 的产品维度依赖接口返回 `appType`。2026-10 之前采集的旧记录没有该字段，只能显示「未标注产品」；产品筛选选项取决于账号已关联哪些产品。
 - 区间补拉假设用量接口接受任意 `start/end` 区间并给出准确的 `total`。官方若改成限死跨度（例如一次最多 31 天），需要把 `requestUsageRange()` 改成分段请求。
 - Trae 的会话对象不含 `session_name`（2026-09-13 实测），因此「模型桶 → 按详情细分」这一维度在 Trae 上不可用；该平台目前也不会出现未分类的模型桶，故不渲染折叠控件。若将来出现 `-` 或空模型名的记录，需要考虑改用 `usage_group_details[].model_display_name` 作为下级维度。
 - **验证方式**：仓库里没有常驻测试。改动后跑两段临时校验——把常量区、区间状态与统计函数切出来做数值断言的切片脚本（34 项），以及用 jsdom 真实加载整个 user.js、配假接口与 GM 桩的六场景 DOM 脚本（73 项，覆盖区间芯片、自定义区间、补拉分页请求体、覆盖提示、输入不被重绘打断、起止互设的 `min` / `max` 与两侧的顶界/撤界、存储里被写坏的倒序区间在「应用」时被拦下、存储里形状非法的起止日不进属性也不进请求体、SPA 离开/回来、老用户无区间存储）。jsdom 没有真实排版，也**不实现 `date` 输入的值净化与日历弹层**，所以视觉层面、「浏览器把日历实际开到哪个月、界外日子是否真置灰」仍只能在三个已登录页面人眼过一遍：密集趋势的标签是否真的不互相压、原生日期选择器在深色面板里的配色、面板宽度与页面内容列的对齐。
+- **v1.14.0 的 WorkBuddy 改版验证**：用 Playwright + 本地 mock 页面（`main.plans-usage` + 双 tab + 假 `/billing/` 接口）跑了 6 个场景：首屏无页面请求时主动取数、页面带 `appTypes` 时补拉剥离筛选、企业版 v2 pageToken 翻页、旧记录无产品字段不渲染产品节、新旧记录混合时给出未标注产品的日期范围、直连接口 500 时自动切 tab 兜底。断言覆盖请求体、请求头、产品分布金额、刷新按钮不 reload、存储条数与产品字段。
 - 回归时的三条恒等式不变：总积分 = 各模型之和、区间内（或近 7 天）= 趋势柱之和、今日 = 趋势图末柱；选中区间后再加上「区间卡片 = 各模型之和」一条。

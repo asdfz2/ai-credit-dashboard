@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.14.0] - 2026-11-01
+
+### Fixed
+
+- **WorkBuddy 新版页面刷新后不取数**：2026-10-30 用户中心前端改版把「套餐与用量」拆成「积分概览 / 消耗明细」两个 tab，默认停在积分概览；用量表只在消耗明细 tab 挂载时才请求 `/billing/meter/get-user-request-usage`。旧版脚本依赖页面请求：刷新后没有请求可拦，`waitForDataAndRender()` 又因本地已有缓存直接 `return`，`bootstrapPlatform()` 永远不执行；面板右上角「刷新页面」只是 `location.reload()`，reload 后仍停在概览，于是表现为「必须手点消耗明细才有数据」。
+  - 首屏主动采集：WorkBuddy 初始化时无论本地有无缓存都请求一次；页面若已自行发过用量请求且没有产品筛选，则跳过这次请求，避免重复。
+  - 鉴权头来源扩展：从任意同域 `/billing/` 请求借用 `X-Client-Platform` / `X-Enterprise-Id`，首屏没有用量请求时也能直接调接口；请求头只放内存，不落盘。
+  - 兜底：直连接口失败时自动切到「消耗明细」tab，让页面自己发请求；只点一次，避免反复触发埋点。
+  - 按钮：WorkBuddy 的「刷新页面」改为「刷新数据」，点击直接取数，不再 reload。
+- **区间补拉被页面产品筛选限制**：页面选中某个产品后请求体会带 `appTypes`，旧版 `requestUsageRange()` 原样复用，补拉只覆盖该产品。现在主动采集与区间补拉都剥掉 `appTypes` / `subscribeType`，并从第 1 页开始把 `pageSize` 抬到 200。
+- **企业版 v2 翻页用错参数**：v2 返回 `nextPageToken`、没有 `total`，旧版按 `pageNum` 自增会重复请求同一页。现在识别 `version: 2` / `nextPageToken`，改用 pageToken 串页，并清掉 `pageNum`。
+
+### Added
+
+- **Buddy One 产品维度**：WorkBuddy 加入 Buddy One 后积分池跨 WorkBuddy / 腾讯文档 / ima / 腾讯网盘共享。`normalize()` 新增 `product: raw.appType`；面板新增「各产品积分消耗」一节，按 `codebuddy` / `doc` / `ima` / `drive` / `meeting` 映射到官方展示名。
+- **旧记录不伪造归属**：v1.14.0 之前采集的记录没有 `appType`，单独说明「另有 N 积分未标注产品」，不塞进某个产品；若一条带产品的记录都没有（未升级 Buddy One），整节不渲染，说明文案保持旧口径。说明里同时给出这些记录的日期范围，便于判断它们是否落在本次补拉窗口之外。
+- **说明文案**：有产品数据时改为 Buddy One 账号级口径，明确腾讯会议不消耗积分。
+
+### Note
+
+- **测试**：用 Playwright + 本地 mock 页面跑了 6 个场景：首屏无页面请求时主动取数、页面带 `appTypes` 时补拉剥离筛选、企业版 v2 pageToken 翻页、旧记录无产品字段不渲染产品节、新旧记录混合时给出未标注产品的日期范围、直连接口 500 时自动切 tab 兜底。断言覆盖请求体、请求头、产品分布金额（124.48 / 4.17 / 10.00，合计 138.65）、刷新按钮不 reload、存储条数与产品字段。
+- 页面自述用量数据有 2–3 小时延迟，刚发生的消耗可能还看不到，这是平台侧延迟，不是脚本没取。
+- 产品筛选选项取决于账号已关联的产品；未关联腾讯文档 / ima / 腾讯网盘的账号只会看到 WorkBuddy。README 的 WorkBuddy 截图尚未替换，等真实页面复核后再更新。
+
 ## [1.13.1] - 2026-10-15
 
 ### Fixed
