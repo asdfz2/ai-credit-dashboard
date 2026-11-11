@@ -3,7 +3,7 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.14.0
+// @version      1.15.0
 // @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、产品/使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
@@ -17,6 +17,8 @@
 // @match        https://www.qwenwork.cn/app/settings/usage*
 // @match        https://www.workbuddy.cn/profile/plans-usage*
 // @match        https://workbuddy.cn/profile/plans-usage*
+// @match        https://www.workbuddy.cn/profile/credits-usage*
+// @match        https://workbuddy.cn/profile/credits-usage*
 // @icon         https://www.trae.cn/favicon.ico
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -33,7 +35,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.14.0';
+        const VERSION = '1.15.0';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -152,6 +154,21 @@
             pageDelayMs: 300
         };
 
+        // 数组顺序是采集顺序，不等于时间顺序（第 1 页最新，自动翻页把更早的接在后面）。
+        // 上限截断必须先按时间排，否则 slice(-max) 丢掉的可能是较新的记录。
+        const sessionTime = (s) => {
+            const ts = parseTime(readSession(s).time);
+            return ts > 0 ? ts : 0;
+        };
+
+        const trimSessionsByTime = (sessions) => {
+            if (!Array.isArray(sessions) || sessions.length <= CONFIG.maxSessions) {
+                return { sessions: sessions, trimmed: false };
+            }
+            sessions.sort((a, b) => sessionTime(a) - sessionTime(b));
+            return { sessions: sessions.slice(-CONFIG.maxSessions), trimmed: true };
+        };
+
         /* ================================================================== *
          * 1. 平台适配表
          *    每个平台声明：如何识别、数据放在哪个存储键、主题、命中哪些接口、
@@ -170,9 +187,13 @@
                 themeClass: '',
                 unitLabel: '会话',
                 modelPlaceholder: 'auto（未标注）',
-                // 插到「用量」Tab 内容区的顶部：它本身就在页面的滚动容器内，
-                // 且带 32px/40px 内边距，面板因此与页面卡片同宽同左边界
-                mountSelectors: ['[id$="-content-usage"]', '[role="tabpanel"]'],
+                // 2026-11 版 dashboard 把用量区改成单页 section，旧的 Tab 容器 id 已不存在。
+                // 新页面给用量区留了稳定的 data-testid；`[role="tabpanel"]` 现在只会命中
+                // 「已申请订单」这类无关区块，不能再当兜底，否则面板会插进别人的 Tab 里。
+                mountSelectors: [
+                    '[data-testid="user-entitlement-usage-management-content"]',
+                    '[id$="-content-usage"]'
+                ],
                 detect: () => /(^|\.)trae\.cn$/.test(HOST) && PATH.indexOf('/dashboard') === 0,
                 // 面板只在用量页显示。SPA 切路由时 pathname / hash 会变，显示与否要用实时值判断。
                 // Trae 的各 Tab 通过 hash 切换（#usage / #account…），离开用量 Tab 即隐藏
@@ -180,17 +201,18 @@
                 pageHash: 'usage',
                 apiUrl: 'https://api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session',
 
-                usageApi: (url) => !!url && url.indexOf('query_user_usage_group_by_session') !== -1,
+                usageApi: (url) => !!url &&
+                    /query_?user_?usage_?group_?by_?session/i.test(url),
 
-                watchApi: (url) => !!url && [
+                watchApi: (url) => !!url && ([
                     '/trae/api/v1/pay/',
                     '/trae/api/v2/pay/',
-                    'query_user_usage_group_by_session',
                     'user_current_entitlement_list',
                     'cn_credits_billing_status',
                     'web_user_pay_status',
                     'expired_ents'
-                ].some((s) => url.indexOf(s) !== -1),
+                ].some((s) => url.indexOf(s) !== -1) ||
+                    /query_?user_?usage_?group_?by_?session/i.test(url)),
 
                 extract(payload) {
                     const root = (payload && payload.data && Array.isArray(payload.data.user_usage_group_by_sessions))
@@ -234,9 +256,12 @@
                 defaultBody() {
                     const end = new Date();
                     const start = new Date(end.getTime() - 29 * 86400000);
+                    // 2026-11 版页面把起止时间改成「秒级数字」直接放进请求体。
+                    // 旧版这里发的是 'YYYY-MM-DD HH:mm:ss' 字符串；没有捕获到页面请求时
+                    // （首屏、直接打开 #usage），字符串会被新版接口拒掉。
                     return {
-                        start_time: fmtDateTime(start),
-                        end_time: fmtDateTime(end),
+                        start_time: Math.floor(start.getTime() / 1000),
+                        end_time: Math.floor(end.getTime() / 1000),
                         page_size: 20,
                         page_num: 1,
                         usage_type: [7]
@@ -274,7 +299,7 @@
                 postFetch: async () => {
                     await bootstrapQwenwork();
                 },
-                note: '统计口径：页面中已加载的积分消耗记录。数据只存在本机浏览器。'
+                note: '统计口径：页面「积分历史」中已加载的逐笔积分消耗记录。数据只存在本机浏览器。'
             },
 
             /* ---------------- WorkBuddy：拦截 API + 自动翻页 ---------------- */
@@ -284,11 +309,13 @@
                 storageKey: 'workbuddy_usage_data',
                 themeClass: 'workbuddy-theme',
                 unitLabel: '请求',
-                // 插到 main.plans-usage 顶部：该元素位于页面的滚动容器内，其内边距
-                // 会让面板与页面卡片左边界对齐
-                mountSelectors: ['main.plans-usage'],
-                detect: () => /(^|\.)workbuddy\.cn$/.test(HOST) && PATH.indexOf('/profile/plans-usage') === 0,
-                pagePath: '/profile/plans-usage',
+                // 2026-11 版把个人中心拆成「套餐与积分」(main.plans-usage) 与
+                // 「积分用量」(main.credits-usage) 两个入口，后者常用于桌面端 iframe。
+                mountSelectors: ['main.plans-usage', 'main.credits-usage'],
+                detect: () => /(^|\.)workbuddy\.cn$/.test(HOST) &&
+                    (PATH.indexOf('/profile/plans-usage') === 0 ||
+                        PATH.indexOf('/profile/credits-usage') === 0),
+                pagePaths: ['/profile/plans-usage', '/profile/credits-usage'],
                 apiUrl: 'https://www.workbuddy.cn/billing/meter/get-user-request-usage',
 
                 // 2026-10 起页面默认停在「积分概览」，只有切到「消耗明细」才挂载表格并发请求。
@@ -329,15 +356,29 @@
                 // 只保留统计需要的字段。
                 // 接口同时返回 input / inputTrunc（用户提示词原文），这里刻意丢弃，不落盘。
                 normalize(raw) {
+                    if (!raw || typeof raw !== 'object') return null;
                     const product = typeof raw.appType === 'string' ? raw.appType.trim() : '';
                     const session = {
-                        session_id: String(raw.requestId || ''),
-                        model_name: String(raw.model || ''),
-                        usage_time: String(raw.requestTime || ''),
-                        credits_float: num(raw.credit),
-                        client: String(raw.client || ''),
-                        purpose: String(raw.agentPurpose || '')
+                        session_id: String(raw.requestId || '')
                     };
+                    // 只写接口确实给出的字段。更新已有记录时 Object.assign 会保留
+                    // 旧值；如果这里用 String(... || '') / num(undefined) 填默认值，
+                    // 一条缺字段的返回就会把已有金额清零、客户端清空。
+                    if (raw.model !== undefined && raw.model !== null && raw.model !== '') {
+                        session.model_name = String(raw.model);
+                    }
+                    if (raw.requestTime !== undefined && raw.requestTime !== null && raw.requestTime !== '') {
+                        session.usage_time = String(raw.requestTime);
+                    }
+                    if (raw.credit !== undefined && raw.credit !== null && raw.credit !== '') {
+                        session.credits_float = num(raw.credit);
+                    }
+                    if (raw.client !== undefined && raw.client !== null && raw.client !== '') {
+                        session.client = String(raw.client);
+                    }
+                    if (raw.agentPurpose !== undefined && raw.agentPurpose !== null && raw.agentPurpose !== '') {
+                        session.purpose = String(raw.agentPurpose);
+                    }
                     // 只有接口真的给出 appType 时才写 product：
                     // 旧响应没有这个字段，写成空串会在合并时覆盖掉已经采集到的产品名
                     if (product) session.product = product;
@@ -428,12 +469,26 @@
                 }
                 return this.cache;
             },
+            /**
+             * 写入并返回成功状态。GM_setValue 在部分管理器（如 ScriptCat）上
+             * 返回 Promise；这里保留同步布尔值，同时把 Promise 归一成
+             * resolve(true) / resolve(false)，调用方按需 await。
+             * @returns {boolean|Promise<boolean>}
+             */
             set(store) {
                 this.cache = store;
                 try {
-                    GM_setValue(PLATFORM.storageKey, JSON.stringify(store));
+                    const result = GM_setValue(PLATFORM.storageKey, JSON.stringify(store));
+                    if (result && typeof result.then === 'function') {
+                        return result.then(() => true, (e) => {
+                            warn('本地数据写入失败:', e);
+                            return false;
+                        });
+                    }
+                    return true;
                 } catch (e) {
                     warn('本地数据写入失败:', e);
+                    return false;
                 }
             },
             sessions() {
@@ -491,10 +546,13 @@
         // 靠它把用户已输入但尚未点「应用」的内容还原回去
         let _rangeDraft = { start: '', end: '' };
 
-        // 存储里的起止日只接受形状正确的值。这不是防御外部输入——这个键只有脚本自己写——
-        // 而是手改过的存储会把任意字符串同时送进属性拼接与补拉请求体，而原生 date 输入框
-        // 本来也放不下这种值，不如直接按「该侧不限」处理
-        const safeDay = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
+        // 存储里的起止日只接受形状正确、且真实存在的本地日期。这不是防御外部输入——
+        // 这个键只有脚本自己写——而是手改过的存储会把任意字符串同时送进属性拼接与补拉
+        // 请求体；2026-02-30 这类形状合法但日历不存在的值也会让区间窗口静默退化成「不限」。
+        const safeDay = (v) => {
+            if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
+            return parseLocalDateKey(v) ? v : null;
+        };
 
         function loadRange() {
             let saved = null;
@@ -508,11 +566,22 @@
             if (isRollingPreset(preset)) {
                 _range = presetRange(preset);
             } else if (preset === RANGE_CUSTOM) {
-                const start = safeDay(saved.start);
-                const end = safeDay(saved.end);
-                // 两侧都不合法（或被清空）时不保留 custom 标识：那样既没有芯片高亮，
-                // 又没有区间可显示，等于渲染一个谁也读不懂的中间态
-                _range = (start || end) ? { preset: RANGE_CUSTOM, start: start, end: end } : presetRange('all');
+                const rawStart = saved.start;
+                const rawEnd = saved.end;
+                const start = safeDay(rawStart);
+                const end = safeDay(rawEnd);
+                const hadStart = rawStart !== undefined && rawStart !== null && rawStart !== '';
+                const hadEnd = rawEnd !== undefined && rawEnd !== null && rawEnd !== '';
+                // 任一侧原本有值但无法解析，或起止倒序，都整体回落到「全部」。
+                // 只丢掉坏的那一侧会让区间悄悄变宽/变窄，比不显示区间更难发现。
+                if ((hadStart && !start) || (hadEnd && !end) || (start && end && start > end)) {
+                    log('区间存储无效，回落到全部');
+                    _range = presetRange('all');
+                } else if (start || end) {
+                    _range = { preset: RANGE_CUSTOM, start: start, end: end };
+                } else {
+                    _range = presetRange('all');
+                }
             } else {
                 _range = presetRange('all');
             }
@@ -525,6 +594,23 @@
             } catch (e) {
                 warn('区间筛选状态写入失败:', e);
             }
+        }
+
+        // 滚动区间只存 preset，起止日按「今天」重算。页面跨过午夜/月初后
+        // _range 里的日期会过期；定时重绘前先补这一拍，避免芯片写着「近 7 天」
+        // 实际还在统计昨天那个窗口。用户正在改草稿时不覆盖。
+        function refreshRollingRange() {
+            if (!isRollingPreset(_range.preset)) return false;
+            const draftDirty = _rangeDraft.start !== (_range.start || '') ||
+                _rangeDraft.end !== (_range.end || '');
+            if (draftDirty) return false;
+            const next = presetRange(_range.preset);
+            if (next.start === _range.start && next.end === _range.end) return false;
+            _range = next;
+            _rangeDraft = { start: next.start || '', end: next.end || '' };
+            saveRange();
+            log('滚动区间已按今天重算:', next.start, '~', next.end);
+            return true;
         }
 
         // 渲染指纹与持久化都用这一份签名：区间变了但记录数没变时也要重绘
@@ -633,17 +719,24 @@
 
         /**
          * 写入重置备份。
-         * @returns {boolean} 是否写成功。失败时调用方必须中止重置——没有撤销点的清空
-         *                   不能放行，宁可让用户手动去油猴存储里留一份。
+         * @returns {boolean|Promise<boolean>} 是否写成功。失败时调用方必须中止重置——
+         *                   没有撤销点的清空不能放行，宁可让用户手动去油猴存储里留一份。
+         *                   部分管理器返回 Promise，调用方需要 await。
          */
         function writeBackup(sessions) {
             try {
-                GM_setValue(BACKUP_KEY, JSON.stringify({
+                const result = GM_setValue(BACKUP_KEY, JSON.stringify({
                     platform: PLATFORM.id,
                     version: VERSION,
                     at: Date.now(),
                     sessions: sessions
                 }));
+                if (result && typeof result.then === 'function') {
+                    return result.then(() => true, (e) => {
+                        fail('重置备份写入失败:', e);
+                        return false;
+                    });
+                }
                 return true;
             } catch (e) {
                 fail('重置备份写入失败:', e);
@@ -653,9 +746,17 @@
 
         function clearBackup() {
             try {
-                GM_setValue(BACKUP_KEY, '');
+                const result = GM_setValue(BACKUP_KEY, '');
+                if (result && typeof result.then === 'function') {
+                    return result.then(() => true, (e) => {
+                        warn('重置备份清除失败:', e);
+                        return false;
+                    });
+                }
+                return true;
             } catch (e) {
                 warn('重置备份清除失败:', e);
+                return false;
             }
         }
 
@@ -663,11 +764,14 @@
          * 把备份合并回当前存储。按记录 ID 去重，且**不覆盖**当前已有的记录：
          * 备份是重置那一刻的旧值，而重置后重新采集到的同一会话可能已经是更新的
          * 一次消耗，回退成旧值等于用一次旧数据污染新数据。
-         * @returns {{added:number, total:number, trimmed:boolean}} 补回条数、合并后总数、是否触发上限截断
+         *
+         * 写入失败时回滚内存副本并保留备份：没有落盘的「已补回」不能当成成功。
+         * @returns {Promise<{added:number, total:number, trimmed:boolean, ok:boolean}>}
          */
-        function restoreBackup(backup) {
+        async function restoreBackup(backup) {
             const store = DataStore.get();
             if (!Array.isArray(store.usage_sessions)) store.usage_sessions = [];
+            const before = store.usage_sessions.slice();
 
             const index = new Set();
             store.usage_sessions.forEach((s) => {
@@ -686,24 +790,25 @@
             });
 
             // 备份里的记录接在数组尾部，追加顺序不等于时间顺序（分页会把更早的记录
-            // 接在后面）。上限截断按「丢掉最旧的」执行，所以先按时间排一遍，
-            // 否则 slice(-maxSessions) 丢掉的可能是刚补回来的新记录。
-            const timeOf = (s) => {
-                const t = parseTime(readSession(s).time);
-                return (t > 0) ? t : 0;
-            };
-            store.usage_sessions.sort((a, b) => timeOf(a) - timeOf(b));
-
-            let trimmed = false;
-            if (store.usage_sessions.length > CONFIG.maxSessions) {
-                store.usage_sessions = store.usage_sessions.slice(-CONFIG.maxSessions);
-                trimmed = true;
-            }
+            // 接在后面）。先按时间排一遍，再交给统一的上限截断，保证丢的是最旧的。
+            store.usage_sessions.sort((a, b) => sessionTime(a) - sessionTime(b));
+            const trimmed = trimSessionsByTime(store.usage_sessions);
+            store.usage_sessions = trimmed.sessions;
 
             // 不动 store.meta.lastUpdate：它展示的是「数据更新时间」，
             // 补回一批旧记录不构成数据变新了，改它等于让面板显示一个假的更新时间
-            DataStore.set(store);
-            return { added: added, total: store.usage_sessions.length, trimmed: trimmed };
+            const ok = await DataStore.set(store);
+            if (!ok) {
+                // DataStore.set 已经把 cache 指向这份未落盘的数据；回滚，
+                // 避免面板显示一批实际写不进去的记录
+                store.usage_sessions = before;
+            }
+            return {
+                added: added,
+                total: store.usage_sessions.length,
+                trimmed: trimmed.trimmed,
+                ok: ok
+            };
         }
 
         /* ================================================================== *
@@ -718,13 +823,21 @@
         // 页面自己最近一次发出用量请求的时间：主动采集前用它判断是否还需要重复请求
         let _lastUsageCaptureAt = 0;
         let _rawFetch = null;
+        let _interceptorInstalled = false;
 
         // 翻页占位放在内存里，不写入本地存储。
         // 历史缺陷：曾把 _autoFetching 持久化，翻页中途关标签页会导致它永久为真、自动翻页从此失效。
         const _pagingInFlight = new Set();
 
-        const isSuccessPayload = (p) => !!p &&
-            (p.success === true || p.code === undefined || p.code === 0 || p.code === 200);
+        const isSuccessPayload = (p) => {
+            if (!p) return false;
+            if (p.success === true) return true;
+            if (p.code === undefined) return true;
+            const code = (typeof p.code === 'string' && p.code.trim() !== '')
+                ? Number(p.code)
+                : p.code;
+            return code === 0 || code === 200;
+        };
 
         function sanitizeHeaders(headers) {
             const blocked = new Set([
@@ -766,7 +879,12 @@
         function computePagination(total, requestBody, records, nextPageToken) {
             const b = requestBody || {};
             const currentPage = num(pick(b, ['pageNum', 'page_num', 'PageNumber', 'page', 'CurrentPage'])) || 1;
-            const pageSize = num(pick(b, ['pageSize', 'page_size', 'PageSize', 'limit'])) || records.length || 20;
+            const requestedPageSize = num(pick(b, ['pageSize', 'page_size', 'PageSize', 'limit'])) || records.length || 20;
+            // 服务端可能把 pageSize 钳到更小的值。用首屏实际返回条数校正，
+            // 否则按请求值算 totalPages 会少算页数，后面的数据永远拉不到。
+            const pageSize = (records.length > 0 && records.length < requestedPageSize)
+                ? records.length
+                : requestedPageSize;
             // 企业版 v2 没有 total，用 nextPageToken 串下一页；不能再用 pageNum 自增，
             // 否则第二页开始就会请求同一份数据（服务端忽略 pageNum）
             if (PLATFORM.tokenPagination && (nextPageToken || num(b.version) === 2)) {
@@ -781,7 +899,7 @@
                 };
             }
             const t = num(total);
-            // 接口没给总条数时转为「自发现翻页」，靠「某页无新增」来终止
+            // 接口没给总条数时转为「自发现翻页」，靠空页 / 连续多页无新增终止
             const totalPages = t > 0
                 ? Math.max(1, Math.ceil(t / Math.max(pageSize, 1)))
                 : currentPage + CONFIG.maxAutoPages;
@@ -789,7 +907,7 @@
         }
 
         /**
-         * 合并一份用量响应。返回 { added } 或 null（无法解析时）。
+         * 合并一份用量响应。返回 { added, updated, parsed } 或 null（无法解析时）。
          * options.skipPagination 为真时不再触发翻页，避免翻页循环里递归翻页。
          */
         function mergePayload(url, payload, requestBody, options) {
@@ -804,7 +922,16 @@
 
             const parsed = PLATFORM.extract(payload);
             let added = 0;
+            let updated = 0;
             let shouldWrite = false;
+
+            const recordsEqual = (a, b) => {
+                try {
+                    return JSON.stringify(a) === JSON.stringify(b);
+                } catch (e) {
+                    return false;
+                }
+            };
 
             if (parsed && parsed.records.length) {
                 const index = new Map();
@@ -814,7 +941,14 @@
                 });
 
                 parsed.records.forEach((raw) => {
-                    const session = PLATFORM.normalize(raw);
+                    if (!raw || typeof raw !== 'object') return;
+                    let session;
+                    try {
+                        session = PLATFORM.normalize(raw);
+                    } catch (e) {
+                        warn('单条记录解析失败，已跳过:', e);
+                        return;
+                    }
                     if (!session) return;
                     const id = readSession(session).id;
                     if (!id) return;
@@ -824,14 +958,18 @@
                         store.usage_sessions.push(session);
                         added++;
                     } else {
-                        // 同一会话的最新版本覆盖旧值
-                        store.usage_sessions[prev] = Object.assign({}, store.usage_sessions[prev], session);
+                        // 同一会话的最新版本覆盖旧值。更新也要触发落盘与重绘，
+                        // 否则 WorkBuddy 的 product 回填、Trae 的会话金额变化只会留在内存里。
+                        const next = Object.assign({}, store.usage_sessions[prev], session);
+                        if (!recordsEqual(next, store.usage_sessions[prev])) {
+                            store.usage_sessions[prev] = next;
+                            updated++;
+                        }
                     }
                 });
 
-                if (store.usage_sessions.length > CONFIG.maxSessions) {
-                    store.usage_sessions = store.usage_sessions.slice(-CONFIG.maxSessions);
-                }
+                const trimmed = trimSessionsByTime(store.usage_sessions);
+                store.usage_sessions = trimmed.sessions;
             }
 
             const extrasChanged = PLATFORM.extras ? PLATFORM.extras(payload, store) === true : false;
@@ -850,7 +988,7 @@
                 });
             }
 
-            if (added > 0 || extrasChanged || scrubbed) shouldWrite = true;
+            if (added > 0 || updated > 0 || extrasChanged || scrubbed) shouldWrite = true;
 
             RETIRED_STORE_KEYS.forEach((k) => {
                 if (Object.prototype.hasOwnProperty.call(store, k)) {
@@ -877,7 +1015,7 @@
                 }
             }
 
-            return { added, parsed };
+            return { added, updated, parsed };
         }
 
         async function fetchAllPages(baseUrl, requestBody, info) {
@@ -892,6 +1030,8 @@
             const lastPage = Math.min(info.totalPages, info.currentPage + CONFIG.maxAutoPages);
             let token = info.nextPageToken || '';
             const seenTokens = new Set();
+            let noNewStreak = 0;
+            let lastPageSig = '';
             log('开始自动翻页: ' + (tokenMode ? 'pageToken 模式' : '当前 ' + info.currentPage + '/' + lastPage) +
                 (info.discovery && !tokenMode ? '（自发现模式）' : ''));
 
@@ -928,11 +1068,34 @@
                         break;
                     }
                     const r = mergePayload(baseUrl, payload, body, { skipPagination: true });
+                    const pageRecords = (r && r.parsed && r.parsed.records) || [];
                     log('已取' + (tokenMode ? '下一页' : '第 ' + (info.currentPage + 1 + step) + ' 页') +
-                        '，新增 ' + (r ? r.added : 0) + ' 条');
-                    if (!r || r.added === 0) {
-                        log('本页无新增，停止翻页');
+                        '，新增 ' + (r ? r.added : 0) + ' 条，更新 ' + (r ? r.updated : 0) + ' 条');
+                    if (!r) break;
+                    if (pageRecords.length === 0) {
+                        log('本页没有记录，停止翻页');
                         break;
+                    }
+
+                    // 「本页没有新增」不等于「没有下一页」：本地可能已经有这一页
+                    // （上次翻页中断），后面仍可能有新数据。分页是否结束只由
+                    // total / pageToken / 空页决定；自发现模式允许连续几页重复再停。
+                    if (!tokenMode) {
+                        const pageSig = pageRecords.map((raw) => readSession(raw).id).join('|');
+                        if (pageSig && pageSig === lastPageSig) {
+                            log('接口返回了与上一页相同的数据，停止翻页');
+                            break;
+                        }
+                        lastPageSig = pageSig;
+                    }
+                    if (r.added === 0) {
+                        noNewStreak++;
+                        if (!tokenMode && info.discovery && noNewStreak >= 3) {
+                            log('连续 3 页无新增，停止自发现翻页');
+                            break;
+                        }
+                    } else {
+                        noNewStreak = 0;
                     }
                     if (tokenMode) {
                         token = (r.parsed && r.parsed.nextPageToken) || '';
@@ -991,6 +1154,8 @@
         }
 
         function setupNetworkInterceptor() {
+            if (_interceptorInstalled) return;
+            _interceptorInstalled = true;
             log('安装网络拦截器…');
 
             const originalFetch = window.fetch;
@@ -1057,9 +1222,21 @@
                     }
                     this.addEventListener('load', function () {
                         if (this.responseType && this.responseType !== 'text' && this.responseType !== 'json') return;
-                        const payload = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
-                        mergePayload(reqInfo.url, payload, reqInfo.body);
-                        renderDashboard();
+                        let payload;
+                        try {
+                            payload = this.responseType === 'json'
+                                ? this.response
+                                : JSON.parse(this.responseText);
+                        } catch (e) {
+                            warn('XHR 响应不是可解析的 JSON，已忽略:', e);
+                            return;
+                        }
+                        try {
+                            mergePayload(reqInfo.url, payload, reqInfo.body);
+                            renderDashboard();
+                        } catch (e) {
+                            warn('XHR 用量响应处理失败:', e);
+                        }
                     });
                 }
                 return originalSend.apply(this, arguments);
@@ -1076,10 +1253,13 @@
         // 最近一次区间补拉实际发出的 url 与请求体，同样只放内存。
         // 诊断信息靠它对照「页面自己发的参数」与「脚本替换后的参数」的形态差异
         let _lastRangeRequest = null;
+        // 本次页面会话里已经补拉过的区间。补拉成功（包括确实 0 条）后记下，
+        // 避免反复点同一个区间反复打接口；失败不记，允许用户重试。
+        const _rangeFetched = new Set();
 
         // 用量接口的一次 POST 请求。主动采集与区间补拉共用，请求头复用页面自己发过的
         // 那一份（鉴权字段是现成的，脚本无从伪造）。
-        // 返回 { ok, reason }：reason 是给用户看的一句话，只描述请求层面发生了什么
+        // 返回 { ok, reason, added, updated }：reason 是给用户看的一句话，只描述请求层面发生了什么
         // （HTTP 状态、接口业务码、异常名），不带响应体——响应体里可能有用户输入。
         async function postUsageRequest(url, body) {
             const doFetch = _rawFetch || window.fetch.bind(window);
@@ -1104,7 +1284,12 @@
                     };
                 }
                 const merged = mergePayload(url, payload, body);
-                return { ok: true, reason: '', added: merged ? merged.added : 0 };
+                return {
+                    ok: true,
+                    reason: '',
+                    added: merged ? merged.added : 0,
+                    updated: merged ? merged.updated : 0
+                };
             } catch (e) {
                 warn('用量请求异常:', e);
                 return { ok: false, reason: '请求异常 ' + ((e && e.name) || '') };
@@ -1131,8 +1316,11 @@
             const merged = Object.assign({}, base || {}, injected || {});
             const body = PLATFORM.continueBody(merged, 1);
             (PLATFORM.stripRequestFields || []).forEach((key) => { delete body[key]; });
-            if (PLATFORM.preferredPageSize) body.pageSize = PLATFORM.preferredPageSize;
-            if (PLATFORM.tokenPagination && num(body.version) === 2) {
+            // 企业版 v2 的 pageSize 由页面自己决定（常见 10/20/50）。v2 请求刻意保持原值：
+            // 抬高 pageSize 在 v2 上没有收益，还可能被服务端拒绝；v1 从第 1 页开始则安全。
+            const tokenV2 = PLATFORM.tokenPagination && num(body.version) === 2;
+            if (PLATFORM.preferredPageSize && !tokenV2) body.pageSize = PLATFORM.preferredPageSize;
+            if (tokenV2) {
                 body.pageToken = '';
                 delete body.pageNum;
             }
@@ -1251,10 +1439,21 @@
             const startDay = range.start ||
                 (span ? span.start : fmtDate(new Date(Date.now() - 29 * 86400000)));
             const endDay = range.end || fmtDate(new Date());
+            const requestSig = (range.preset || RANGE_CUSTOM) + '|' +
+                (range.start || '') + '|' + (range.end || '');
 
-            // 区间已被本地数据覆盖时不请求：反复点预设会反复打同一个接口
-            if (span && startDay >= span.start && endDay <= span.end) {
-                log('所选区间已被本地数据覆盖，跳过补拉');
+            if (_rangeFetched.has(requestSig)) {
+                log('该区间本次会话已补拉过，跳过');
+                return false;
+            }
+
+            // 区间已被本地数据覆盖时才跳过；「span 覆盖」不等于「这段真的采过」，
+            // 所以要求区间内至少有一条本地记录。否则先补拉 1 月、再补拉 3 月后，
+            // 选 2 月会被误判为已覆盖，静默显示 0。
+            const localInRange = applyRange(DataStore.sessions(), range).sessions.length;
+            if (span && localInRange > 0 &&
+                startDay >= span.start && endDay <= span.end) {
+                log('所选区间已被本地记录覆盖，跳过补拉');
                 return false;
             }
 
@@ -1277,14 +1476,20 @@
             renderDashboard(true);
             const res = await postUsageRequest(url, body);
             await waitForPaging();
+
             // 区间内本来就没有记录与补到了新数据是两回事，文案要分开：
             // 前者是「这段时间没消耗」，后者才是「数据已到位」
             if (res.ok) {
+                _rangeFetched.add(requestSig);
                 _rangeHint = {
                     active: false,
                     text: res.added > 0
                         ? '已按区间补拉，新增 ' + res.added + ' 条，本地共 ' + DataStore.count() + ' 条记录'
-                        : '该区间内没有消耗记录，本地共 ' + DataStore.count() + ' 条记录'
+                        : (res.updated > 0
+                            ? '已按区间补拉，刷新 ' + res.updated + ' 条已有记录，本地共 ' + DataStore.count() + ' 条记录'
+                            : (localInRange > 0
+                                ? '区间内已有记录均为最新，本地共 ' + DataStore.count() + ' 条记录'
+                                : '该区间内没有消耗记录，本地共 ' + DataStore.count() + ' 条记录'))
                 };
             } else {
                 _rangeHint = {
@@ -1353,23 +1558,59 @@
          * 6. QwenWork 专用的 DOM 提取
          * ================================================================== */
 
-        // 先在小范围交互元素里找，找不到再回退到全页扫描（避免每次都遍历整棵 DOM 读 innerText）
+        // 先在小范围交互元素里找，找不到再回退到全页扫描（避免每次都遍历整棵 DOM 读 innerText）。
+        // 2026-11 版把「已使用」改成「积分消耗 / 获得积分 / 过期积分」三个 tab，
+        // 默认停在「积分消耗」，因此这里要同时兼容新旧两种入口文案。
+        function qwenworkTabText(el) {
+            return String((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+        }
+
         function findQwenworkUsedTab() {
-            const quick = document.querySelectorAll('button, [role="tab"], [role="button"], [class*="tab"]');
+            const wanted = [
+                '积分消耗', '积分扣减', '已使用',
+                'Credits spent', 'Credits deducted', 'Used'
+            ];
+            const quick = document.querySelectorAll('[role="tab"], button, [role="button"]');
             for (const el of quick) {
-                if (el.children.length === 0 && (el.innerText || '').trim() === '已使用') return el;
+                if (wanted.indexOf(qwenworkTabText(el)) !== -1) return el;
+            }
+            // 旧页面可能把入口渲染成带 tab 类名的普通节点；只对旧文案做全页兜底，
+            // 避免把新页面表格里的「积分消耗」表头当成可点击入口。
+            const old = document.querySelectorAll('[class*="tab"]');
+            for (const el of old) {
+                if (qwenworkTabText(el) === '已使用') return el;
             }
             const all = document.querySelectorAll('*');
             for (const el of all) {
-                if (el.children.length === 0 && (el.innerText || '').trim() === '已使用') return el;
+                if (el.children.length === 0 && qwenworkTabText(el) === '已使用') {
+                    return el.closest('[role="tab"]') || el.closest('button') || el;
+                }
             }
             return null;
         }
 
-        function findQwenworkDataContainer() {
+        // 新页面的「积分历史」section 有稳定 id（usage-history-heading）与带
+        // aria-label 的 tablist；优先用它，旧页面再从「已使用」入口向上找。
+        function findQwenworkHistorySection() {
+            const heading = document.getElementById('usage-history-heading');
+            if (heading) {
+                return heading.closest('section') || heading.parentElement;
+            }
+            const tablists = document.querySelectorAll('[role="tablist"]');
+            for (const list of tablists) {
+                const label = list.getAttribute('aria-label') || '';
+                if (/积分历史|credit history/i.test(label)) {
+                    let node = list;
+                    for (let depth = 0; depth < 10 && node; depth++) {
+                        const text = node.textContent || '';
+                        if (DATETIME_LOOSE_RE.test(text) && text.length > 100) return node;
+                        node = node.parentElement;
+                    }
+                    return list.parentElement;
+                }
+            }
             const usedTab = findQwenworkUsedTab();
             if (!usedTab) return null;
-
             let node = usedTab.parentElement;
             for (let depth = 0; depth < 15; depth++) {
                 if (!node || node === document.body) break;
@@ -1383,13 +1624,52 @@
             return node;
         }
 
+        function findQwenworkDataContainer() {
+            return findQwenworkHistorySection();
+        }
+
+        /**
+         * 把容器里的文本按「叶子节点」拆成行。
+         * 不用 innerText：新版列表在窄屏会把时间/来源隐藏进 `hidden sm:block`
+         * 的 span 里，innerText 直接拿不到；而 `sm:hidden` 的「来源 · 时间」
+         * 摘要行又会和时间行重复，按 class 跳过它。
+         */
+        function collectQwenworkLines(container) {
+            const lines = [];
+            const walk = (node) => {
+                if (!node) return;
+                if (node.nodeType === 3) {
+                    const text = String(node.nodeValue || '').trim();
+                    if (text) lines.push(text);
+                    return;
+                }
+                if (node.nodeType !== 1) return;
+                const tag = node.tagName;
+                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG' || tag === 'TEMPLATE') return;
+                const cls = String(node.className || '');
+                // 窄屏摘要行（source · time）只在移动端显示；时间与来源另有独立节点，
+                // 再收一遍会让「时间/来源/详情/金额」的四行结构错位。
+                if (/(^|\s)sm:hidden(\s|$)/.test(cls)) return;
+                if (!node.firstElementChild) {
+                    const text = String(node.textContent || '').trim();
+                    if (text) lines.push(text);
+                    return;
+                }
+                for (const child of node.childNodes) walk(child);
+            };
+            walk(container);
+            return lines;
+        }
+
         // 上一次解析的结构化统计，仅用于诊断输出（只记数量，不记内容）
         let _lastQwenworkParse = { dateLines: 0, amountLines: 0, textLength: 0 };
 
         // 读取金额。优先按原样解析，取不到再退回「从行内找第一个带符号的数字」
         function readSignedAmount(line) {
             const raw = String(line || '');
-            const compact = raw.replace(/[,，\s]/g, '');
+            // 有些格式化器输出 Unicode 减号（U+2212）或全角减号；先归一成 ASCII，
+            // 否则下面的 parseFloat 会把它当成普通数字，负向金额被误判为正数。
+            const compact = raw.replace(/[\u2212\uFF0D]/g, '-').replace(/[,，\s]/g, '');
             if (!compact) return NaN;
             // 金额行不应该是日期时间，避免把 2026-09-13 里的 -09 当成金额
             if (DATETIME_LOOSE_RE.test(compact)) return NaN;
@@ -1406,7 +1686,13 @@
 
         function parseRecordsFromQwenworkDOM(container) {
             const text = container ? (container.innerText || '') : '';
-            const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+            const innerLines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+            // 新版「积分历史」有响应式列：桌面/窄屏的可见行不同，统一按叶子节点收集
+            // （能读到 display:none 的时间/来源，并跳过 sm:hidden 的摘要行）。
+            // 旧页面沿用 innerText 的视觉行，避免隐藏的浮层/提示混进来。
+            const isNewHistory = !!document.getElementById('usage-history-heading') ||
+                !!document.querySelector('[role="tablist"][aria-label*="积分历史"]');
+            const lines = isNewHistory ? collectQwenworkLines(container) : innerLines;
             _lastQwenworkParse = { dateLines: 0, amountLines: 0, textLength: text.length };
 
             const found = [];
@@ -1441,9 +1727,15 @@
                 });
             }
 
+            const negatives = found.filter((r) => r.amount < 0);
             // 「已使用」区域里的金额通常带负号。若页面改成渲染成正数，
             // 则回退按正数处理，避免整页一条都取不到。
-            const negatives = found.filter((r) => r.amount < 0);
+            // 但新版「积分历史」有三个 tab（积分消耗 / 获得积分 / 过期积分），
+            // 「获得积分」的金额天然是正数；没有负号时不能回退，否则会把收入算成消耗。
+            if (isNewHistory && found.length > 0 && negatives.length === 0) {
+                log('QwenWork: 新版积分历史未发现负向金额，可能不在「积分消耗」tab，本次跳过');
+                return [];
+            }
             const chosen = negatives.length > 0 ? negatives : found;
             if (found.length > 0 && negatives.length === 0) {
                 log('QwenWork: 未发现带负号的金额，按正数处理 ' + found.length + ' 条');
@@ -1464,8 +1756,19 @@
         }
 
         // QwenWork 记录的内容 ID：同一「时间 + 来源 + 详情 + 金额」视为同一条。
+        // 新版把空详情显示成「未命名任务」，旧版可能显示短横线；两者都不是真实详情，
+        // 归一成空串，避免同一笔记录因为展示占位符变化而拿到新 ID。
+        const qwenworkDetailKey = (v) => {
+            const s = String(v || '').trim();
+            return /^(?:未命名任务|Untitled(?: task)?|—|-|（无详情）)$/.test(s) ? '' : s;
+        };
+        const qwenworkSourceKey = (v) => {
+            const s = String(v || '').trim();
+            return /^(?:—|-|未知来源)$/.test(s) ? '' : s;
+        };
         function qwenworkId(time, source, detail, amount) {
-            return 'qw-' + time + '|' + (source || '未知来源') + '|' + (detail || '') + '|' + num(amount);
+            return 'qw-' + time + '|' + (qwenworkSourceKey(source) || '未知来源') + '|' +
+                qwenworkDetailKey(detail) + '|' + num(amount);
         }
 
         // QwenWork 的会话写入本地存储（历史缺陷：此前只存在内存里，刷新即丢）
@@ -1506,9 +1809,8 @@
             });
 
             if (added > 0 || migrated) {
-                if (store.usage_sessions.length > CONFIG.maxSessions) {
-                    store.usage_sessions = store.usage_sessions.slice(-CONFIG.maxSessions);
-                }
+                const trimmed = trimSessionsByTime(store.usage_sessions);
+                store.usage_sessions = trimmed.sessions;
                 store.meta = Object.assign({}, store.meta, {
                     platform: 'qwenwork',
                     lastUpdate: Date.now()
@@ -1545,16 +1847,106 @@
             return records;
         }
 
+        /**
+         * Radix 的 DropdownMenu 触发器在 pointerdown 上打开，单纯 el.click() 不一定能唤起菜单。
+         * 按真实鼠标顺序补一遍 pointer/mouse 事件，再补 click；普通按钮也能被 click 兜住。
+         */
+        function qwenworkUserClick(el) {
+            if (!el) return false;
+            const opts = { bubbles: true, cancelable: true, button: 0, buttons: 1 };
+            try {
+                if (typeof PointerEvent === 'function') {
+                    el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({}, opts, {
+                        pointerId: 1, pointerType: 'mouse', isPrimary: true
+                    })));
+                }
+            } catch (e) { }
+            try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (e) { }
+            try {
+                if (typeof PointerEvent === 'function') {
+                    el.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, opts, {
+                        pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0
+                    })));
+                }
+            } catch (e) { }
+            try { el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, opts, { buttons: 0 }))); } catch (e) { }
+            try { el.click(); return true; } catch (e) { return false; }
+        }
+
+        /**
+         * 2026-11 版新增「分类明细 / 原始流水」两种视图，默认是「原始流水」，
+         * 两种视图可能包含同一笔记录。旧脚本采集的是逐笔流水（时间/来源/详情/金额），
+         * 因此固定切到「原始流水」；切换失败时宁可本次不采，也不要和已有流水混用口径。
+         */
+        async function ensureQwenworkTransactionView() {
+            const triggers = [
+                '[aria-label*="积分历史视图"]',
+                '[aria-label*="Credit history view"]',
+                '[aria-label*="credit history view"]'
+            ];
+            let trigger = null;
+            for (const sel of triggers) {
+                trigger = document.querySelector(sel);
+                if (trigger) break;
+            }
+            if (!trigger) return true; // 旧页面没有视图切换
+
+            const current = qwenworkTabText(trigger);
+            if (/原始流水|Raw transactions|Transactions/i.test(current)) return true;
+
+            const findRawItem = () => {
+                const items = document.querySelectorAll(
+                    '[role="menuitem"], [role="option"], [data-radix-collection-item]'
+                );
+                for (const item of items) {
+                    if (/原始流水|Raw transactions|Transactions/i.test(qwenworkTabText(item))) return item;
+                }
+                return null;
+            };
+
+            // 菜单可能还没挂载（页面仍在 hydration）或第一次点击被吞掉；
+            // 先看是否已经打开，再点开，最多重试 3 次。不要在菜单已打开时重复点触发器，
+            // 那会把它关掉。
+            for (let attempt = 0; attempt < 3; attempt++) {
+                let item = findRawItem();
+                if (item) {
+                    qwenworkUserClick(item);
+                    await sleep(800);
+                    return true;
+                }
+                try {
+                    if (!qwenworkUserClick(trigger)) throw new Error('click failed');
+                } catch (e) {
+                    warn('QwenWork: 打开「积分历史视图」菜单失败:', e);
+                    return false;
+                }
+                await sleep(500);
+                item = findRawItem();
+                if (item) {
+                    qwenworkUserClick(item);
+                    await sleep(800);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         async function bootstrapQwenwork() {
             const tab = await waitForQwenworkTab(15000);
             if (tab) {
                 try {
                     tab.click();
+                    await sleep(500);
                 } catch (e) {
-                    warn('QwenWork: 点击「已使用」失败:', e);
+                    warn('QwenWork: 点击「积分消耗」失败:', e);
                 }
             } else {
-                log('QwenWork: 未找到「已使用」入口');
+                log('QwenWork: 未找到「积分消耗 / 已使用」入口');
+            }
+
+            if (!(await ensureQwenworkTransactionView())) {
+                warn('QwenWork: 未能切到「原始流水」视图，本次跳过采集，避免与已有逐笔数据重复');
+                return 0;
             }
 
             const records = await waitForQwenworkRecords(15000);
@@ -1566,27 +1958,33 @@
                 return 0;
             }
 
-            const before = DataStore.count();
-            mergeQwenworkRecords(records);
+            const wasComplete = !!(DataStore.get().meta && DataStore.get().meta.qwenworkComplete);
+            const addedFirst = mergeQwenworkRecords(records);
 
             // 页面可能停留在上次采集遗留的页码上：先退回第 1 页再重新解析一次，
             // 保证拿到的是最新的记录（列表按时间倒序，新记录总在第 1 页）
             await returnToFirstPage();
             const fresh = await waitForQwenworkRecords(8000);
-            if (fresh.length > 0) mergeQwenworkRecords(fresh);
+            const addedFresh = fresh.length > 0 ? mergeQwenworkRecords(fresh) : 0;
 
-            // 首页（最新一页）没有新记录时，更早的页也不可能有新记录（列表按时间倒序）。
-            // 跳过翻页：既省请求，也避免把页码留在中途——否则用户下次进来看到的不是最新记录
-            if (DataStore.count() === before) {
+            // 首页（最新一页）没有新记录，且上次采集已经走到过最后一页，才跳过翻页。
+            // 上次若中途中断（qwenworkComplete=false），即使首页无新增也要继续，
+            // 否则缺失的旧页会永远补不回来。
+            if (addedFirst + addedFresh === 0 && wasComplete) {
                 log('QwenWork: 记录均已采集过，跳过翻页');
                 return records.length;
             }
 
+            let complete = false;
             try {
-                await fetchAllQwenworkPagesFromDOM();
+                complete = await fetchAllQwenworkPagesFromDOM();
             } catch (e) {
                 warn('QwenWork 翻页失败:', e);
             }
+            const store = DataStore.get();
+            store.meta = Object.assign({}, store.meta, { qwenworkComplete: complete });
+            await DataStore.set(store);
+            log('QwenWork: 本次采集' + (complete ? '已到最后一页' : '未完成，下次继续'));
             return records.length;
         }
 
@@ -1596,13 +1994,19 @@
                 log('QwenWork: 未找到数据容器，跳过翻页');
                 return false;
             }
-            mergeQwenworkRecords(parseRecordsFromQwenworkDOM(container));
+
+            const firstRecords = parseRecordsFromQwenworkDOM(container);
+            mergeQwenworkRecords(firstRecords);
+            let lastSig = firstRecords.map((r) => r.session_id).join('|');
 
             let page = 1;
+            let complete = false;
+            let noNewStreak = 0;
             while (page < CONFIG.maxAutoPages) {
                 const pagination = findPaginationContainer();
                 if (!pagination) {
                     log('QwenWork: 未找到翻页控件，只有一页');
+                    complete = true;
                     break;
                 }
                 const nextBtn = findNextPageButton(pagination);
@@ -1610,6 +2014,7 @@
                     nextBtn.classList.contains('disabled') ||
                     nextBtn.getAttribute('aria-disabled') === 'true') {
                     log('QwenWork: 已到最后一页');
+                    complete = true;
                     break;
                 }
 
@@ -1627,25 +2032,53 @@
                     log('QwenWork: 翻页后数据容器丢失');
                     break;
                 }
-                const added = mergeQwenworkRecords(parseRecordsFromQwenworkDOM(container));
+                const pageRecords = parseRecordsFromQwenworkDOM(container);
+                if (pageRecords.length === 0) {
+                    log('QwenWork: 翻页后没有记录，视为最后一页');
+                    complete = true;
+                    break;
+                }
+                const sig = pageRecords.map((r) => r.session_id).join('|');
+                if (sig && sig === lastSig) {
+                    // 点了下一页但内容没变：说明已经翻不动了（或被页面拦住）。
+                    // 记为已到最后一页，避免每次打开都重复点同一条分页。
+                    log('QwenWork: 分页内容没有变化，视为已到最后一页');
+                    complete = true;
+                    break;
+                }
+                lastSig = sig;
+
+                const added = mergeQwenworkRecords(pageRecords);
                 log('QwenWork: 第 ' + page + ' 页新增 ' + added + ' 条');
-                if (added === 0) break;
+                // 不能用「本页无新增」判断结束：本地可能已经采过这一页，
+                // 后面仍可能有缺失的旧页。内容签名变化说明确实翻到了新的一页。
+                if (added === 0) {
+                    noNewStreak++;
+                    if (noNewStreak >= 3) {
+                        log('QwenWork: 连续 3 页无新增，停止翻页');
+                        break;
+                    }
+                } else {
+                    noNewStreak = 0;
+                }
             }
 
             // 采集完把分页退回第 1 页：否则页面停留在最后一页，
             // 用户下次进来看到的就不是最新的记录
             await returnToFirstPage();
-            return true;
+            return complete;
         }
 
         // 把分页退回第 1 页。页面自己会记住页码，采集完不退回的话，
         // 用户下次进入时看到的就不是最新的记录。
         async function returnToFirstPage() {
-            const pagination = findPaginationContainer();
+            let pagination = findPaginationContainer();
             if (!pagination) return;
-            const nodes = pagination.querySelectorAll('li, button, a, span, [role="button"]');
+
+            // 数字分页：直接点页码 1（只点可交互节点，避免命中「共 1 页」之类的文本）
+            const nodes = pagination.querySelectorAll('button, a, [role="button"], li');
             for (const el of nodes) {
-                if ((el.textContent || '').trim() !== '1') continue;
+                if (qwenworkTabText(el) !== '1') continue;
                 try {
                     el.click();
                 } catch (e) {
@@ -1655,6 +2088,39 @@
                 log('QwenWork: 分页已退回第 1 页');
                 return;
             }
+
+            // 2026-11 版是游标分页，只给「上一页」：连续点到按钮禁用为止。
+            // 最多 50 次，防止页面把禁用态渲染成可点击时死循环。
+            for (let i = 0; i < 50; i++) {
+                pagination = findPaginationContainer();
+                if (!pagination) return;
+                const prev = findPreviousPageButton(pagination);
+                if (!prev || prev.disabled ||
+                    prev.classList.contains('disabled') ||
+                    prev.getAttribute('aria-disabled') === 'true') {
+                    break;
+                }
+                try {
+                    prev.click();
+                } catch (e) {
+                    return;
+                }
+                await sleep(900);
+            }
+            log('QwenWork: 分页已退回第 1 页');
+        }
+
+        function findPreviousPageButton(container) {
+            const candidates = container.querySelectorAll('button, a, [role="button"]');
+            for (const el of candidates) {
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                const text = (el.textContent || '').trim();
+                if (aria === '上一页' || aria === 'Previous page' ||
+                    text === '上一页' || text === '‹' || text === '<') {
+                    return el;
+                }
+            }
+            return null;
         }
 
         function findPaginationContainer() {
@@ -1736,8 +2202,19 @@
                 return 0;
             }
             if (typeof raw === 'string') {
+                const text = raw.trim();
+                if (!text) return 0;
+                // 有些接口/历史数据把秒级或毫秒级时间戳存成字符串。
+                // 交给 new Date() 会被当成非法日期，导致整条记录失去日维度。
+                if (/^\d{10,13}$/.test(text)) return parseTime(Number(text));
+                // 只有日期时按本地自然日解析：new Date('YYYY-MM-DD') 会按 UTC，
+                // 在东八区之外可能落到前一天。
+                if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+                    const day = parseLocalDateKey(text);
+                    return day ? day.getTime() : 0;
+                }
                 // 统一成 ISO 风格再交给 Date 解析，"2026-09-13 18:02:00" 在部分环境解析不稳
-                const normalized = raw.trim().replace(' ', 'T');
+                const normalized = text.replace(' ', 'T');
                 const ts = new Date(normalized).getTime();
                 return Number.isFinite(ts) ? ts : 0;
             }
@@ -1759,9 +2236,35 @@
                 const name = String(pick(g, ['model_display_name', 'model_name']) || '');
                 const credit = num(pick(g, ['credits_float', 'amount_float']));
                 if (!name && !credit) return;
-                out.push({ name: name || MODEL_PLACEHOLDER, cents: Math.round(credit * 100) });
+                out.push({ name: name || MODEL_PLACEHOLDER, credit: credit });
             });
             return out.length ? out : null;
+        }
+
+        /**
+         * 把会话总额（分）分配给各个模型分组。直接对每个 group 单独
+         * Math.round(credit*100) 会让「总额 = 各模型之和」在 0.005 这类
+         * 半分布上差 1 分；这里用最大余数法分配，保证分币级守恒。
+         */
+        function allocateGroupCents(groups, totalCents) {
+            const exact = groups.map((g) => num(g.credit) * 100);
+            const cents = exact.map((v) => Math.floor(v));
+            let remaining = totalCents - cents.reduce((a, b) => a + b, 0);
+            const order = exact
+                .map((v, i) => ({ i: i, frac: v - Math.floor(v) }))
+                .sort((a, b) => b.frac - a.frac);
+            for (let k = 0; remaining > 0 && k < order.length; k++) {
+                cents[order[k].i] += 1;
+                remaining--;
+            }
+            let k = order.length - 1;
+            while (remaining < 0 && k >= 0) {
+                cents[order[k].i] -= 1;
+                remaining++;
+                k--;
+            }
+            if (remaining !== 0 && cents.length) cents[cents.length - 1] += remaining;
+            return cents;
         }
 
         // 趋势的按周聚合：长区间逐日柱子会挤成一团，合并进自然周（周一起始）后
@@ -1857,10 +2360,12 @@
                 // 回退到会话级的模型名
                 const groups = readModelGroups(raw);
                 if (groups) {
-                    groups.forEach((g) => {
-                        bumpModel(g.name, g.cents);
+                    const groupCents = allocateGroupCents(groups, cents);
+                    groups.forEach((g, i) => {
+                        const c = groupCents[i];
+                        bumpModel(g.name, c);
                         if (isFallbackLabel(g.name)) {
-                            bumpChild(modelChildMap, g.name, s.detail || '（无详情）', g.cents);
+                            bumpChild(modelChildMap, g.name, s.detail || '（无详情）', c);
                         }
                     });
                 } else {
@@ -2062,11 +2567,15 @@
             // 的日期打断。数据仍在后台合并，失焦或定时兜底重绘时补上
             if (!force && isRangeInputFocused(container)) return;
 
+            refreshRollingRange();
             const allSessions = Array.isArray(store.usage_sessions) ? store.usage_sessions : [];
             const filtered = applyRange(allSessions, _range);
-            // 指纹必须含区间：切换区间时记录条数可能不变（例如两个都不含数据的区间）
+            // 指纹必须含区间：切换区间时记录条数可能不变（例如两个都不含数据的区间）。
+            // 还要含当前本地日期：跨午夜后今日/近 7 天/本月会变化，但条数和
+            // lastUpdate 都可能没变，不含日期就会永远停在昨天的数字。
             const key = PLATFORM.id + ':' + filtered.sessions.length + ':' +
-                ((store.meta && store.meta.lastUpdate) || 0) + ':' + rangeSignature();
+                ((store.meta && store.meta.lastUpdate) || 0) + ':' + fmtDate(new Date()) +
+                ':' + rangeSignature();
             if (!force && container.dataset.renderKey === key) return;
             container.dataset.renderKey = key;
 
@@ -2144,7 +2653,7 @@
 
             const resetBtn = container.querySelector('.tee-reset');
             if (resetBtn) {
-                resetBtn.addEventListener('click', () => {
+                resetBtn.addEventListener('click', async () => {
                     const store = DataStore.get();
                     const count = DataStore.count();
                     if (count === 0) {
@@ -2166,25 +2675,35 @@
                     if (!window.confirm(lines.join('\n'))) return;
 
                     // 先落备份再清空。顺序反了就等于在一个没有撤销点的清空上继续，
-                    // 而 GM 存储配额不足时 GM_setValue 是会抛的
-                    if (!writeBackup(store.usage_sessions)) {
+                    // 而 GM 存储配额不足时 GM_setValue 是会抛的；ScriptCat 等管理器
+                    // 还可能返回 Promise，必须等它真正写完再 reload。
+                    const backupOk = await writeBackup(store.usage_sessions);
+                    if (!backupOk) {
                         window.alert('备份写入失败，已取消重置。仍要清空的话，请先在脚本管理器的存储里手动留一份。');
                         return;
                     }
 
+                    const sessionsBeforeClear = store.usage_sessions;
                     store.usage_sessions = [];
-                    DataStore.set(store);
+                    const cleared = await DataStore.set(store);
+                    if (!cleared) {
+                        // 没写进去就不算清空；把内存副本还原，避免页脚随后误报 0 条
+                        store.usage_sessions = sessionsBeforeClear;
+                        DataStore.cache = store;
+                        window.alert('清空写入失败，已取消重置。备份仍保留在本地。');
+                        return;
+                    }
                     window.location.reload();
                 });
             }
 
             const restoreBtn = container.querySelector('.tee-restore');
             if (restoreBtn) {
-                restoreBtn.addEventListener('click', () => {
+                restoreBtn.addEventListener('click', async () => {
                     const backup = readBackup();
                     if (!backup) {
                         window.alert('没有可用的重置备份。');
-                        renderDashboard();
+                        renderDashboard(true);
                         return;
                     }
                     if (!window.confirm(
@@ -2193,13 +2712,25 @@
                         '\n恢复后本次备份即被清除。'
                     )) return;
 
-                    const result = restoreBackup(backup);
-                    clearBackup();
+                    const result = await restoreBackup(backup);
+                    if (!result.ok) {
+                        window.alert('恢复写入失败，数据没有落盘；备份已保留，可稍后重试。');
+                        renderDashboard(true);
+                        return;
+                    }
+                    const cleared = await clearBackup();
+                    if (!cleared) {
+                        window.alert('数据已恢复，但备份清除失败；备份仍在，可稍后手动处理。');
+                        renderDashboard(true);
+                        return;
+                    }
                     window.alert(
                         '已补回 ' + result.added + ' 条记录，当前共 ' + result.total + ' 条。' +
                         (result.trimmed ? '\n\n超出 ' + CONFIG.maxSessions + ' 条上限，最旧的记录已被截断。' : '')
                     );
-                    renderDashboard();
+                    // 必须强制重绘：补回 0 条时记录条数与 lastUpdate 都没变，
+                    // 非强制渲染会被指纹挡掉，页脚仍显示已经清除的「恢复备份」。
+                    renderDashboard(true);
                 });
             }
 
@@ -2275,7 +2806,7 @@
         // 原生 date 的区间界：给了它就把界外的日子置灰，输入框为空时日历
         // 还会直接开到界内的那个月，用户不必逐月翻页去找
         const dateBound = (name, value) =>
-            (value ? ' ' + name + '="' + escapeHtml(value) + '"' : '');
+            (value ? ' ' + name + '="' + escapeAttr(value) + '"' : '');
 
         /**
          * 区间选择控件：预设芯片 + 自定义起止日期。
@@ -2303,11 +2834,11 @@
                 '<span class="tee-range-custom">' +
                 '<input class="tee-date tee-date-start" type="date" aria-label="起始日期"' +
                 dateBound('max', _rangeDraft.end) + ' value="' +
-                escapeHtml(_rangeDraft.start) + '">' +
+                escapeAttr(_rangeDraft.start) + '">' +
                 '<span class="tee-range-dash">至</span>' +
                 '<input class="tee-date tee-date-end" type="date" aria-label="结束日期"' +
                 dateBound('min', _rangeDraft.start) + ' value="' +
-                escapeHtml(_rangeDraft.end) + '">' +
+                escapeAttr(_rangeDraft.end) + '">' +
                 '<button type="button" class="tee-btn tee-range-apply">应用</button>' +
                 '</span>' +
                 '</div>' +
@@ -2555,7 +3086,7 @@
             return '<div class="tee-chart">' + rows.map((r) => {
                 return '' +
                     '<div class="tee-row">' +
-                    '<div class="tee-name" title="' + escapeHtml(r.name) + '">' + escapeHtml(r.name) + '</div>' +
+                    '<div class="tee-name" title="' + escapeAttr(r.name) + '">' + escapeHtml(r.name) + '</div>' +
                     '<div class="tee-bar-wrap">' + barHtml(r.credits, max) + '</div>' +
                     '<div class="tee-amount">' + formatNumber(r.credits) + ' 积分</div>' +
                     '<div class="tee-count">' + r.calls + ' ' + unitLabel + '</div>' +
@@ -2580,12 +3111,12 @@
             const max = Math.max.apply(null, children.map((c) => c.credits).concat([1]));
 
             return '' +
-                '<details class="tee-sub" data-subkey="' + escapeHtml(key) + '">' +
+                '<details class="tee-sub" data-subkey="' + escapeAttr(key) + '">' +
                 '<summary class="tee-sub-summary">按' + escapeHtml(childLabel) + '细分 · ' + children.length + ' 项</summary>' +
                 '<div class="tee-sub-body">' + children.map((c) => {
                     return '' +
                         '<div class="tee-sub-row">' +
-                        '<div class="tee-name tee-sub-name" title="' + escapeHtml(c.name) + '">' + escapeHtml(c.name) + '</div>' +
+                        '<div class="tee-name tee-sub-name" title="' + escapeAttr(c.name) + '">' + escapeHtml(c.name) + '</div>' +
                         '<div class="tee-bar-wrap tee-sub-bar-wrap">' + barHtml(c.credits, max) + '</div>' +
                         '<div class="tee-amount">' + formatNumber(c.credits) + ' 积分</div>' +
                         '<div class="tee-count">' + c.calls + '</div>' +
@@ -2610,7 +3141,7 @@
                 const valueText = formatNumber(d.cents / 100) + ' 积分 · ' + d.calls + ' 次';
                 return '' +
                     '<div class="tee-trend-col">' +
-                    '<div class="tee-trend-bar" title="' + escapeHtml(d.date + '：' + valueText) +
+                    '<div class="tee-trend-bar" title="' + escapeAttr(d.date + '：' + valueText) +
                     '" style="height:' + pct + '%">' +
                     '<span class="tee-trend-value">' + escapeHtml(formatNumber(d.cents / 100)) + '</span>' +
                     '</div>' +
@@ -2634,6 +3165,12 @@
             return div.innerHTML;
         }
 
+        // escapeHtml 走 textContent，不会转义双引号；属性值必须再用它包一层，
+        // 否则模型名/详情里的 `"` 会截断 title、data-subkey 等属性。
+        function escapeAttr(str) {
+            return escapeHtml(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
         /**
          * 是否仍在用量页。SPA 切路由时 pathname / hash 会变，
          * 而脚本只在启动时判定过一次平台，因此这里必须用实时值重新判断。
@@ -2641,7 +3178,8 @@
          */
         function isOnUsagePage() {
             if (window.location.hostname !== HOST) return false;
-            if (window.location.pathname.indexOf(PLATFORM.pagePath) !== 0) return false;
+            const paths = PLATFORM.pagePaths || (PLATFORM.pagePath ? [PLATFORM.pagePath] : []);
+            if (!paths.some((p) => window.location.pathname.indexOf(p) === 0)) return false;
             const hash = window.location.hash;
             // 页面带 hash 时（如 Trae 用 hash 切换 Tab），hash 不指向用量页就隐藏
             if (PLATFORM.pageHash && hash && hash.indexOf(PLATFORM.pageHash) === -1) return false;
@@ -3374,12 +3912,19 @@
         function init() {
             log('初始化，平台 ' + PLATFORM.id + '，版本 v' + VERSION);
             loadRange();
-            setupNetworkInterceptor();
             waitForDataAndRender();
             observePageChanges();
 
             // 定时兜底：只有数据指纹变化或面板被移除时才会真正重绘
             setInterval(() => renderDashboard(), CONFIG.refreshInterval);
+        }
+
+        // 拦截器必须在 document-start 阶段就装上：页面首屏的用量请求可能早于
+        // DOMContentLoaded，晚装会漏掉请求体/请求头，只能退到默认参数兜底。
+        try {
+            setupNetworkInterceptor();
+        } catch (e) {
+            warn('网络拦截器安装失败，将依赖主动采集兜底:', e);
         }
 
         if (document.readyState === 'complete' || document.readyState === 'interactive') {

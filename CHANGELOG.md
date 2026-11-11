@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.15.0] - 2026-11-11
+
+### Changed
+
+- **适配 2026-11 三平台改版**：按当前线上前端包（Trae 3.4.x / WorkBuddy 5.11 / QwenWork「积分历史」新版）复核了平台识别、挂载点、请求体与 DOM 提取。三个平台的用量页都保留了旧入口，因此改动以「新版优先、旧版回退」的方式落地，不切换存储键，也不重采历史。
+
+### Fixed
+
+- **Trae 面板挂到了无关的 Tab 里**：新版 dashboard 把用量区改成单页 section，旧的 `[id$="-content-usage"]` 已不存在，而 `[role="tabpanel"]` 在新版只命中「已申请订单」等区块，面板会被插进别人的 Tab。现在优先用新版稳定的 `[data-testid="user-entitlement-usage-management-content"]`，旧 id 作为回退。
+- **Trae 首屏主动采集的请求体日期形态过期**：新版 `query_user_usage_group_by_session` 的 `start_time` / `end_time` 是秒级数字，旧版 `defaultBody()` 仍发 `'YYYY-MM-DD HH:mm:ss'` 字符串；没有捕获到页面请求时（直接打开 `#usage`、首屏）会被接口拒掉。默认体改为秒级数字，区间补拉仍由 `matchRequestShape()` 跟随页面请求的实际形态。
+- **QwenWork 新版找不到「已使用」入口，整页采不到数据**：新版把用量页改成「积分历史」section，tab 变为「积分消耗 / 积分扣减 / 获得积分 / 过期积分」（分类明细视图叫「积分消耗」，原始流水视图叫「积分扣减」），旧入口文案与容器定位都失效。现在用 `#usage-history-heading` / `role="tablist"` 的 aria-label 定位，旧版「已使用」保留为回退。
+- **QwenWork 窄屏读不到时间**：新版列表在窄屏把时间/来源放进 `hidden sm:block`，`innerText` 取不到；`sm:hidden` 的「来源 · 时间」摘要行又会与四行结构错位。新版「积分历史」现在统一按叶子节点收集文本（桌面/窄屏都能读到隐藏列，并跳过响应式摘要行），旧版页面继续用 `innerText`。
+- **QwenWork 新旧视图混算**：新版新增「分类明细 / 原始流水」两种视图，默认原始流水，且页面明确提示两种视图可能包含同一笔记录。脚本固定切到「原始流水」再采集（与旧版逐笔流水口径一致）；切换失败时本次跳过，避免与已有逐笔数据重复。
+- **QwenWork 游标分页回不到第 1 页**：新版分页只有「上一页 / 下一页」，没有页码 1 可点。`returnToFirstPage()` 增加连续点「上一页」直到禁用的回退。
+- **QwenWork 可能把「获得积分」算成消耗**：新版「积分历史」有三个 tab，旧逻辑在「一条负数都找不到」时会按正数处理；若停留在「获得积分」tab，收入就会被当成消耗。新版页面没有负向金额时现在直接跳过；同时把「未命名任务」/短横线等空详情占位符归一，避免同一笔记录因展示文案变化而换 ID。
+- **WorkBuddy 新版「积分用量」页不注入**：个人中心新增 `/profile/credits-usage`（`main.credits-usage`，桌面端常以 `?embed=1` 打开），原 `@match` 与挂载选择器只覆盖 `plans-usage`。现在两个路径都匹配、都挂载，存储键与 API 口径不变。
+- **WorkBuddy 企业版 v2 的 `pageSize` 不再被抬高**：v1 从第 1 页开始时抬到 200 是安全的；v2 的 `pageSize` 由页面自己决定，抬高既无收益又可能被服务端拒绝。现在 v2 保持页面原值，只把 `pageToken` 清空、`pageNum` 删除。
+
+### Note
+
+- 用 Playwright + 本地 mock 页面跑了 5 组回归：Trae 新版挂载点与秒级请求体、WorkBuddy `plans-usage` v1 分页、WorkBuddy `credits-usage` v2 `nextPageToken` 分页、QwenWork 新版桌面/窄屏与「分类明细 → 原始流水」切换、旧版 QwenWork「已使用」页面。断言覆盖面板挂载父节点、请求体形态、记录数、总额与产品/使用端分布，全部通过。
+- 未在真实登录页运行；QwenWork 新版已出现 `/user/billings`、`/user/billings/sessions` 等计费接口（旧文档里「用量接口 404」的结论已过期）。本次仍走 DOM 提取，避免与历史逐笔数据口径冲突；后续可评估改为接口采集 + 增量迁移。
+- Trae 新版用量区仍可能随 `dashboardTabs` 配置变化；本次依赖的 `data-testid` 与 `usage-history-heading` 均来自当前线上包，若官方再次改版需同步复核。
+
+## [1.14.1] - 2026-11-06
+
+### Fixed
+
+- **已有会话的更新只进内存，不落盘也不重绘**：`mergePayload()` 此前只把 `added > 0` 当作写入条件，同一 `session_id` 的金额/model/product 变化走 `Object.assign` 后既不更新 `meta.lastUpdate`，也不触发重绘。现在用字段比较检测真实更新，更新同样落盘并进入渲染指纹；WorkBuddy 的 `appType` 回填不会再因为「本次没有新记录」而一直不显示。
+- **自动翻页把「本页无新增」当成结束**：`fetchAllPages()` / `fetchAllQwenworkPagesFromDOM()` 在某一页全是本地已有记录时直接 `break`，上次翻页中断后，后面缺失的页再也补不回来。现在分页结束由 `total` / `pageToken` / 空页 / 连续重复页决定；token 模式即使本页无新增也继续跟随 `nextPageToken`。QwenWork 增加「上次是否已到最后一页」标记，中断后下次会继续翻。
+- **区间补拉只比较 min/max，忽略中间空洞**：先补 1 月、再补 3 月后，选 2 月会被误判为「已被本地数据覆盖」而不发请求，静默显示 0。现在要求所选区间内至少有一条本地记录才跳过补拉；补拉过的区间在同一页面会话内去重，避免反复点预设重复请求。
+- **5000 条上限按插入顺序截断**：数组顺序是采集顺序（第 1 页最新，旧页追加在后），`slice(-maxSessions)` 可能丢掉较新的记录。合并、QwenWork 入库与备份恢复统一先按 `parseTime` 排序再截断。
+- **恢复备份在写入失败时仍清除备份**：`DataStore.set()` 捕获异常后没有返回状态，恢复按钮随后无条件 `clearBackup()`。现在写入返回成功状态，恢复失败会回滚内存副本并保留备份；重置也会等待 backup / clear 写入完成（兼容返回 Promise 的脚本管理器）后再 reload。
+- **跨午夜/跨月后「今日 / 近 7 天 / 本月」不更新**：渲染指纹加入当前本地日期；滚动预设（近 7 天 / 近 30 天 / 本月）在跨日时按今天重算，用户正在编辑的日期草稿不会被覆盖。
+- **拦截器装得太晚**：`setupNetworkInterceptor()` 原本在 DOMContentLoaded 后的 `init()` 里执行，首屏用量请求可能已经发出。现在在脚本执行时立即安装，DOM 渲染仍延后。
+- 其他加固：存储里的日期同时校验日历有效性与起止顺序（`2026-02-30`、倒序对回落到「全部」）；WorkBuddy `normalize()` 只写接口确实返回的字段，缺字段的响应不再把已有金额清零；单条坏记录不再中断整批合并；`escapeHtml` 之外新增属性转义，模型的 `"` 不再截断 `title` / `data-subkey`；模型分组按最大余数法分配分币，保持「总额 = 各模型之和」；`code: "0"` 与数字字符串时间戳可被识别；XHR 非 JSON 响应不再抛未捕获异常。
+
+### Note
+
+- 用 jsdom 加载完整脚本、配 GM 存储 / 假时钟 / 假接口跑了 15 项主断言（更新落盘、产品回填、上限截断、区间空洞、跨日、备份失败、分页续拉、pageSize 钳制等）与多项补充检查，全部通过；未在真实登录页运行。
+- 未改动 `@match`，从站内其它路由 pushState 进入用量页时的注入覆盖仍需真实页面确认；QwenWork 的 DOM 结构、WorkBuddy 服务端是否真正接受 `pageSize=200` 也仍需线上复核。
+
 ## [1.14.0] - 2026-11-01
 
 ### Fixed
