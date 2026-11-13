@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.15.1] - 2026-11-13
+
+### Fixed
+
+- **QwenWork 缺来源/详情的记录会被整行丢掉**：新版「积分历史」的来源列是条件渲染的（没有来源的记录整列省略），旧解析固定读 `lines[base+3]` 取金额，行内少一个叶子就会把金额读成下一行的日期，整条记录丢失，后面的行也会跟着错位（实测两条记录 2.50 + 1.25 只统计到 1.25）。现在先按日期行切段，每段独立判断金额位置（只在前 3 个叶子里从后往前找纯金额行），来源/详情缺省也能正确落库；正常四行记录的 ID 不变，不会重复入库。
+- **Trae legacy 计费账号的首屏主动采集可能被过滤成空**：`defaultBody()` 固定带 `usage_type:[7]`，而页面只在 credits 计费下才带这个字段。现在从 `cn_credits_billing_status` 记录 `is_credits_billing`（兼容 `data` 包装），明确为 false 时省略 `usage_type`；拿不到状态时保持旧行为。
+- **WorkBuddy 企业版的 `X-Enterprise-Id` 可能被礼包/补偿请求覆盖**：旧逻辑只借用「最近一次 `/billing/` 请求」的头；新版页面新增的礼包、补偿接口不一定带企业头。现在单独缓存带 `x-enterprise-id` 的那一份，主动采集时补回。
+
+### Changed
+
+- **文档纠正**：QwenWork 新版已有 `/user/billings`、`/user/billings/sessions` 等接口；脚本仍走 DOM 是为了与历史逐笔口径一致，不再写成「接口 404 / 没有可用接口」。README FAQ、代码注释与新增的 `docs/COMPATIBILITY-2026-11-13.md` 同步。
+
+### Note
+
+- 复核了三平台 2026-11-12/13 的线上包（Trae dashboard chunk 11-13 20:47、WorkBuddy 5.11.3 主包 11-13 15:29、QwenWork usage chunk 11-13 00:37，均为北京时间），33 项锚点/字段全部存在；不需要为兼容性改版，本次只做健壮性修补。
+- 用 Playwright + 本地 mock 页面跑了 11 组回归：Trae 新版挂载与请求体（未知 / credits / legacy 三种计费状态）、WorkBuddy `plans-usage` v1、WorkBuddy `credits-usage` v2 `nextPageToken`、WorkBuddy 企业头在礼包请求之后仍能补回、QwenWork 新版四行结构、分类明细 → 原始流水切换、两页游标分页、缺来源边界、空详情 / 拆分日期边界、旧版 QwenWork「已使用」页面。断言覆盖挂载父节点、请求体与请求头形态、记录数、总额与产品/使用端分布，全部通过。
+- 未在真实登录页运行；真实登录态下的鉴权、限流与视觉对齐仍需线上复核。
+
 ## [1.15.0] - 2026-11-11
 
 ### Changed

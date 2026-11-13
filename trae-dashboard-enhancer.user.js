@@ -3,7 +3,7 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.15.0
+// @version      1.15.1
 // @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、产品/使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
@@ -35,7 +35,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.15.0';
+        const VERSION = '1.15.1';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -178,6 +178,11 @@
         const HOST = window.location.hostname;
         const PATH = window.location.pathname;
 
+        // Trae 的计费模型：只有 credits 计费才在用量请求里带 usage_type:[7]。
+        // 页面通过 cn_credits_billing_status 返回 is_credits_billing；legacy 账号的
+        // 请求体里没有这个字段。null 表示还没拿到状态，此时沿用旧行为（带 [7]）。
+        let _traeCreditsBilling = null;
+
         const PLATFORMS = {
             /* ---------------- Trae：拦截 API + 自动翻页 ---------------- */
             trae: {
@@ -237,8 +242,18 @@
                         store.entitlement = payload;
                         changed = true;
                     }
-                    if (payload && payload.is_credits_billing !== undefined) {
-                        store.billing_status = payload;
+                    // 接口可能把字段放在 data 里（生成客户端解包与否取决于版本），两种都认
+                    const billing = (payload && payload.is_credits_billing !== undefined)
+                        ? payload
+                        : ((payload && payload.data && payload.data.is_credits_billing !== undefined)
+                            ? payload.data
+                            : null);
+                    if (billing) {
+                        store.billing_status = billing;
+                        // 只认布尔值：字符串 "false" 用 !! 会变成 true
+                        if (typeof billing.is_credits_billing === 'boolean') {
+                            _traeCreditsBilling = billing.is_credits_billing;
+                        }
                         changed = true;
                     }
                     return changed;
@@ -259,13 +274,25 @@
                     // 2026-11 版页面把起止时间改成「秒级数字」直接放进请求体。
                     // 旧版这里发的是 'YYYY-MM-DD HH:mm:ss' 字符串；没有捕获到页面请求时
                     // （首屏、直接打开 #usage），字符串会被新版接口拒掉。
-                    return {
+                    const body = {
                         start_time: Math.floor(start.getTime() / 1000),
                         end_time: Math.floor(end.getTime() / 1000),
                         page_size: 20,
-                        page_num: 1,
-                        usage_type: [7]
+                        page_num: 1
                     };
+                    // legacy 计费账号的页面请求不带 usage_type；主动采集带 [7] 会被过滤成空。
+                    // 拿不到状态时保持旧行为，避免影响 credits 账号。
+                    let credits = _traeCreditsBilling;
+                    if (credits === null) {
+                        try {
+                            const billing = DataStore.get().billing_status;
+                            if (billing && typeof billing.is_credits_billing === 'boolean') {
+                                credits = billing.is_credits_billing;
+                            }
+                        } catch (e) { }
+                    }
+                    if (credits !== false) body.usage_type = [7];
+                    return body;
                 },
 
                 // 自选区间的起止字段。该接口按本地时间字符串过滤，首尾各取整日边界，
@@ -290,7 +317,8 @@
                 mountSelectors: ['.rounded-2xl'],
                 detect: () => /(^|\.)qwenwork\.cn$/.test(HOST) && PATH.indexOf('/app/settings/usage') === 0,
                 pagePath: '/app/settings/usage',
-                // QwenWork 用量接口返回 404，数据只能从页面 DOM 取
+                // QwenWork 新版已有 /user/billings 等计费接口；脚本仍从页面 DOM 取，
+                // 与历史逐笔记录保持同一口径（见 docs/COMPATIBILITY-2026-11-13.md）
                 apiUrl: null,
                 usageApi: () => false,
                 watchApi: () => false,
@@ -820,6 +848,9 @@
         // 主动采集需要从这里借用 X-Client-Platform / X-Enterprise-Id 等请求头。
         // 只放内存，绝不写入本地存储。
         let _lastBillingRequest = { url: '', headers: {}, at: 0 };
+        // 企业版鉴权头。新版页面会发礼包 / 补偿等 billing 请求，它们不一定带
+        // X-Enterprise-Id；只记住「带该头的那一份」，避免被后续请求覆盖。
+        let _lastEnterpriseHeaders = null;
         // 页面自己最近一次发出用量请求的时间：主动采集前用它判断是否还需要重复请求
         let _lastUsageCaptureAt = 0;
         let _rawFetch = null;
@@ -838,6 +869,17 @@
                 : p.code;
             return code === 0 || code === 200;
         };
+
+        // 记录最近一次 billing 请求的头；带 X-Enterprise-Id 的单独留一份。
+        // 企业版和个人版的用量请求只差这个头，丢了会拉到错误的账号维度。
+        function rememberBillingHeaders(url, headers) {
+            _lastBillingRequest = { url: url, headers: headers || {}, at: Date.now() };
+            const lower = {};
+            Object.keys(headers || {}).forEach((key) => {
+                lower[String(key).toLowerCase()] = headers[key];
+            });
+            if (lower['x-enterprise-id']) _lastEnterpriseHeaders = lower;
+        }
 
         function sanitizeHeaders(headers) {
             const blocked = new Set([
@@ -872,6 +914,12 @@
             // Trae 是跨域接口，平白多一个自定义头会触发额外的 CORS 预检
             if (PLATFORM.headerApi && !headers['x-client-platform']) {
                 headers['x-client-platform'] = 'web';
+            }
+            // 企业版：最近一次 billing 请求可能来自礼包/补偿接口，没有企业头。
+            // 从单独缓存的「带企业头的那一份」补回来。
+            if (PLATFORM.headerApi && !headers['x-enterprise-id'] &&
+                _lastEnterpriseHeaders && _lastEnterpriseHeaders['x-enterprise-id']) {
+                headers['x-enterprise-id'] = _lastEnterpriseHeaders['x-enterprise-id'];
             }
             return headers;
         }
@@ -1171,7 +1219,7 @@
                         headers
                     };
                     if (PLATFORM.headerApi && PLATFORM.headerApi(url)) {
-                        _lastBillingRequest = { url, headers, at: Date.now() };
+                        rememberBillingHeaders(url, headers);
                     }
                     if (PLATFORM.usageApi(url)) {
                         _lastApiRequest = reqInfo;
@@ -1207,7 +1255,7 @@
             XMLHttpRequest.prototype.send = function (body) {
                 const url = this._teeUrl;
                 if (url && PLATFORM.headerApi && PLATFORM.headerApi(url)) {
-                    _lastBillingRequest = { url, headers: this._teeHeaders || {}, at: Date.now() };
+                    rememberBillingHeaders(url, this._teeHeaders || {});
                 }
                 if (url && PLATFORM.watchApi(url)) {
                     const reqInfo = {
@@ -1428,7 +1476,7 @@
          * 按所选区间主动向接口取数（Trae / WorkBuddy）。
          * 面板默认只覆盖页面自身请求触及的范围（通常最近 30 天），不补拉的话，
          * 选更早的区间等于在筛一份本来就不存在的数据。
-         * QwenWork 没有可用接口（PLATFORM.rangeFields 缺失），只能筛本地已采集记录。
+         * QwenWork 未启用接口采集（PLATFORM.rangeFields 缺失），只能筛本地已采集记录。
          */
         async function requestUsageRange(range) {
             if (!PLATFORM.rangeFields || !PLATFORM.apiUrl) return false;
@@ -1684,6 +1732,36 @@
             return plain ? parseFloat(plain[0]) : NaN;
         }
 
+        // 新版「积分历史」的来源列是条件渲染的（没有来源的旧记录整列省略）。
+        // 这时行内只剩「时间 / 详情 / 金额」，固定读 lines[base+3] 会把金额读成下一行的日期，
+        // 整条记录被丢掉，后面每一行也会跟着错位。用已知来源文案判断哪一行是来源。
+        const QWENWORK_SOURCE_LABELS = [
+            '桌面版', '桌面端', '网页版', '网页端', '移动端', '钉钉端', '定时任务', '其他',
+            'Desktop', 'Web', 'Mobile', 'DingTalk', 'Scheduled task', 'Scheduler', 'Other',
+            '—', '-'
+        ];
+        function isQwenworkSourceLine(line) {
+            const t = String(line || '').trim();
+            return !!t && QWENWORK_SOURCE_LABELS.indexOf(t) !== -1;
+        }
+
+        // 在一段文本里找金额所在的下标。只在记录的前 3 个叶子里从后往前找
+        // 「纯金额」行，避免把「任务 3」这类详情里的数字当成金额；
+        // 也不按段尾找，因为最后一条记录后面可能跟着分页/表头等页面文案。
+        function findQwenworkAmountIndex(segment) {
+            const limit = Math.min(segment.length, 3);
+            for (let i = limit - 1; i >= 0; i--) {
+                const compact = String(segment[i] || '')
+                    .replace(/[\u2212\uFF0D]/g, '-')
+                    .replace(/[,，\s]/g, '');
+                if (!compact || compact.length > 16) continue;
+                if (!/^[¥￥$]?[+\-]?\d+(?:\.\d+)?$/.test(compact)) continue;
+                if (DATETIME_LOOSE_RE.test(compact)) continue;
+                return i;
+            }
+            return segment.length >= 3 ? 2 : segment.length - 1;
+        }
+
         function parseRecordsFromQwenworkDOM(container) {
             const text = container ? (container.innerText || '') : '';
             const innerLines = text.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -1695,37 +1773,65 @@
             const lines = isNewHistory ? collectQwenworkLines(container) : innerLines;
             _lastQwenworkParse = { dateLines: 0, amountLines: 0, textLength: text.length };
 
-            const found = [];
+            // 先按日期行切段：两条日期之间的文本属于同一条记录。
+            // 新版来源/详情可能缺省，按固定下标读金额会错位；切段后每段独立判断，
+            // 坏掉一行不会连累后面的记录。
+            const anchors = [];
             for (let i = 0; i < lines.length; i++) {
-                let time = null;
-                let base = i;
-
                 const sameLine = lines[i].match(DATETIME_LINE_RE);
                 if (sameLine) {
-                    time = sameLine[1] + '-' + sameLine[2] + '-' + sameLine[3] + ' ' + sameLine[4];
-                } else {
-                    // 兼容「日期」与「时间」被拆成两行的渲染方式
-                    const dateOnly = lines[i].match(DATE_ONLY_LINE_RE);
-                    const timeOnly = lines[i + 1] || '';
-                    if (dateOnly && TIME_ONLY_LINE_RE.test(timeOnly)) {
-                        time = dateOnly[1] + '-' + dateOnly[2] + '-' + dateOnly[3] + ' ' + timeOnly;
-                        base = i + 1;
-                    }
+                    anchors.push({
+                        index: i,
+                        start: i + 1,
+                        time: sameLine[1] + '-' + sameLine[2] + '-' + sameLine[3] + ' ' + sameLine[4]
+                    });
+                    continue;
                 }
-                if (!time) continue;
+                // 兼容「日期」与「时间」被拆成两行的渲染方式
+                const dateOnly = lines[i].match(DATE_ONLY_LINE_RE);
+                if (dateOnly && TIME_ONLY_LINE_RE.test(lines[i + 1] || '')) {
+                    anchors.push({
+                        index: i,
+                        start: i + 2,
+                        time: dateOnly[1] + '-' + dateOnly[2] + '-' + dateOnly[3] + ' ' + lines[i + 1]
+                    });
+                    i++;
+                }
+            }
+
+            const found = [];
+            anchors.forEach((anchor, k) => {
+                const end = (k + 1 < anchors.length) ? anchors[k + 1].index : lines.length;
+                const segment = lines.slice(anchor.start, end)
+                    .map((line) => String(line || '').trim())
+                    .filter(Boolean);
+                if (segment.length === 0) return;
                 _lastQwenworkParse.dateLines++;
 
-                const amount = readSignedAmount(lines[base + 3]);
-                if (!Number.isFinite(amount) || amount === 0) continue;
+                const amountIndex = findQwenworkAmountIndex(segment);
+                const amount = readSignedAmount(segment[amountIndex]);
+                if (!Number.isFinite(amount) || amount === 0) return;
                 _lastQwenworkParse.amountLines++;
 
+                const before = segment.slice(0, amountIndex);
+                let source = '';
+                let detail = '';
+                if (before.length >= 2) {
+                    source = before[0];
+                    detail = before.slice(1).join(' ');
+                } else if (before.length === 1) {
+                    // 只有一行时无法靠位置判断：是来源就归来源，否则当详情
+                    if (isQwenworkSourceLine(before[0])) source = before[0];
+                    else detail = before[0];
+                }
+
                 found.push({
-                    time: time,
-                    source: lines[base + 1] || '',
-                    detail: lines[base + 2] || '',
+                    time: anchor.time,
+                    source: source,
+                    detail: detail,
                     amount: amount
                 });
-            }
+            });
 
             const negatives = found.filter((r) => r.amount < 0);
             // 「已使用」区域里的金额通常带负号。若页面改成渲染成正数，
@@ -2768,7 +2874,7 @@
         /**
          * 重置到底会丢什么，按平台的数据来源分别说明。
          * 三个平台的可恢复范围差得很远：Trae / WorkBuddy 能补拉平台保留的窗口，
-         * QwenWork 的接口返回 404，只能靠此刻页面渲染出来的内容。
+         * QwenWork 未启用接口采集，只能靠此刻页面渲染出来的内容。
          * 笼统写一句「会重新采集」等于没提示——用户会以为刷新一下就等于原样恢复。
          */
         function resetLossNote() {
@@ -3812,7 +3918,7 @@
             const limit = maxRetries || 30;
             renderDashboard(true);
 
-            // QwenWork 没有可用接口，直接走 DOM 提取。
+            // QwenWork 未启用接口采集，直接走 DOM 提取。
             // 首次没取到数据时继续重试：SPA 首屏渲染时机不定，一次失败不代表页面上没有数据。
             if (PLATFORM.postFetch) {
                 let attempt = 0;

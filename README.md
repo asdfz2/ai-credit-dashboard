@@ -100,6 +100,7 @@
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── COMPATIBILITY-2026-11.md
+│   ├── COMPATIBILITY-2026-11-13.md
 │   └── images/
 │       ├── QwenWork.png
 │       ├── Trae.png
@@ -120,7 +121,7 @@
 
 ## 兼容性与限制
 
-2026-11 三平台改版的审查结论、证据与回归结果见 [docs/COMPATIBILITY-2026-11.md](docs/COMPATIBILITY-2026-11.md)。
+2026-11 三平台改版的审查结论、证据与回归结果见 [docs/COMPATIBILITY-2026-11.md](docs/COMPATIBILITY-2026-11.md)；2026-11-13 三平台再次构建后的复核见 [docs/COMPATIBILITY-2026-11-13.md](docs/COMPATIBILITY-2026-11-13.md)。
 
 **Trae**
 
@@ -163,7 +164,7 @@
 
 **想统计更早的时间段？**
 
-Trae 与 WorkBuddy 在选定早于本地数据的区间时会自动向用量接口补拉该区间的分页数据；QwenWork 没有可用接口，只能统计本地已采集的部分，面板会直接说明覆盖范围。
+Trae 与 WorkBuddy 在选定早于本地数据的区间时会自动向用量接口补拉该区间的分页数据；QwenWork 页面已有 `/user/billings` 等接口，但脚本为了与历史逐笔记录保持同一口径仍从页面读取，只能统计本地已采集的部分，面板会直接说明覆盖范围。
 
 **数据会上传吗？**
 
