@@ -3,7 +3,7 @@
 // @namespace    https://github.com/asdfz2/Trae_Qwen-dashboard-enhancer
 //               ↑ namespace 刻意不跟随仓库名：脚本管理器以 namespace + name 识别脚本，
 //                 改掉它会让已安装用户出现新旧两个脚本并存。它只是个隐形标识，保持稳定即可。
-// @version      1.15.1
+// @version      1.15.2
 // @description  在 Trae、QwenWork、WorkBuddy 用量页面添加积分消耗总数、各模型积分消耗、产品/使用端分布、近 7 天趋势，并支持自选日期范围筛选统计
 // @author       asdfz2
 // @license      MIT
@@ -35,7 +35,7 @@
          * 0. 常量与通用工具
          * ================================================================== */
 
-        const VERSION = '1.15.1';
+        const VERSION = '1.15.2';
 
         // 需要排查问题时把 DEBUG 改成 true，控制台会输出完整流程日志
         const DEBUG = false;
@@ -920,6 +920,15 @@
             if (PLATFORM.headerApi && !headers['x-enterprise-id'] &&
                 _lastEnterpriseHeaders && _lastEnterpriseHeaders['x-enterprise-id']) {
                 headers['x-enterprise-id'] = _lastEnterpriseHeaders['x-enterprise-id'];
+            }
+            // 2026-11-20 版个人中心把当前企业 ID 放在 sessionStorage，axios 拦截器
+            // 每次请求都会补这个头。首屏还没有 billing 请求可借时，直接读同一个键。
+            if (PLATFORM.headerApi && !headers['x-enterprise-id']) {
+                try {
+                    const enterpriseId = window.sessionStorage &&
+                        window.sessionStorage.getItem('profile-enterpriseId');
+                    if (enterpriseId) headers['x-enterprise-id'] = enterpriseId;
+                } catch (e) { }
             }
             return headers;
         }
@@ -2002,7 +2011,7 @@
 
             const findRawItem = () => {
                 const items = document.querySelectorAll(
-                    '[role="menuitem"], [role="option"], [data-radix-collection-item]'
+                    '[role="menuitem"], [role="menuitemradio"], [role="option"], [data-radix-collection-item]'
                 );
                 for (const item of items) {
                     if (/原始流水|Raw transactions|Transactions/i.test(qwenworkTabText(item))) return item;

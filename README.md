@@ -101,6 +101,7 @@
 │   ├── ARCHITECTURE.md
 │   ├── COMPATIBILITY-2026-11.md
 │   ├── COMPATIBILITY-2026-11-13.md
+│   ├── COMPATIBILITY-2026-11-22.md
 │   └── images/
 │       ├── QwenWork.png
 │       ├── Trae.png
@@ -121,7 +122,7 @@
 
 ## 兼容性与限制
 
-2026-11 三平台改版的审查结论、证据与回归结果见 [docs/COMPATIBILITY-2026-11.md](docs/COMPATIBILITY-2026-11.md)；2026-11-13 三平台再次构建后的复核见 [docs/COMPATIBILITY-2026-11-13.md](docs/COMPATIBILITY-2026-11-13.md)。
+2026-11 三平台改版的审查结论、证据与回归结果见 [docs/COMPATIBILITY-2026-11.md](docs/COMPATIBILITY-2026-11.md)；2026-11-13 与 2026-11-22 两次构建后的复核分别见 [docs/COMPATIBILITY-2026-11-13.md](docs/COMPATIBILITY-2026-11-13.md) 与 [docs/COMPATIBILITY-2026-11-22.md](docs/COMPATIBILITY-2026-11-22.md)。
 
 **Trae**
 

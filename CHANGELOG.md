@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.15.2] - 2026-11-22
+
+### Fixed
+
+- **QwenWork 切不回「原始流水」时整页采不到数据**：2026-11-21 版把「积分历史视图」改成自定义菜单，选项渲染为 `role="menuitemradio"`（旧版是 `menuitem` / `option`）。`ensureQwenworkTransactionView()` 只查后两种角色，页面不在「原始流水」时会切换失败并按设计跳过采集，面板显示 0 条。现在把 `menuitemradio` 一并纳入选择器；在 mock 里验证：修复前 0 条，修复后 2 条 / 3.75。
+- **WorkBuddy 企业版首屏可能拿不到企业维度**：2026-11-20 版把当前企业 ID 放进 `sessionStorage.profile-enterpriseId`，由 axios 拦截器给每个请求补 `X-Enterprise-Id`。脚本首屏主动采集时若还没有 billing 请求可借，就会按个人口径请求。现在增加同一个 sessionStorage 键的兜底读取；仍以页面实际请求头为准。
+
+### Changed
+
+- 复核了 2026-11-20/21 的三平台构建：Trae 的 `data-testid`、`#usage`、秒级请求体、`page_num` 与响应字段未变；WorkBuddy 的 `main.plans-usage` / `main.credits-usage`、用量接口、v1/v2 翻页与 `requestTime/credit/model/client` 字段未变；QwenWork 的 `#usage-history-heading`、tablist、原始流水视图、游标分页与行结构未变。本次只修上述两处新引入的兼容性细节。
+
+### Note
+
+- 用 Playwright + 本地 mock 跑了 6 组回归：Qwen `menuitemradio` 视图切换（修复前 0 条 / 修复后 2 条 3.75）、Qwen 四行与缺来源解析、WorkBuddy v1/v2 翻页、WorkBuddy sessionStorage 企业头、Trae 请求体（秒级 + `usage_type`）。全部通过。
+- 未在真实登录页运行；真实登录态下的鉴权、限流与视觉对齐仍需线上复核。
+
 ## [1.15.1] - 2026-11-13
 
 ### Fixed
